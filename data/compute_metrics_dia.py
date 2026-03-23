@@ -39,6 +39,29 @@ def compute_metrics(input_csv: str, output_csv: str | None = None) -> Path:
     df["return_5d"] = df[close_col] / df[close_col].shift(5) - 1
     df["realized_vol_20d"] = df["return_1d"].rolling(window=20).std() * np.sqrt(252)
 
+     # --- STEP 3: SYNTHETIC OPTION FEATURES ---
+
+    # Spot price
+    df["spot"] = df[close_col]
+
+    # Nearest ATM strike (simple $1 grid)
+    df["strike"] = df["spot"].round()
+
+    # Days to expiration
+    df["dte"] = 30
+
+    # Time to expiration (years)
+    df["T"] = df["dte"] / 365
+
+    # Volatility (use realized vol)
+    df["sigma"] = df["realized_vol_20d"]
+
+    # Risk-free rate (constant)
+    df["r"] = 0.03
+
+    # Option type
+    df["option_type"] = "call"
+    
     # --- OUTPUT ---
     if output_csv is None:
         output_path = input_path.with_name(f"{input_path.stem}_with_metrics.csv")
