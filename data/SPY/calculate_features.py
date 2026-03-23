@@ -23,6 +23,29 @@ df["daily_return"] = df["close"].pct_change()
 # Realized volatility (20-day rolling)
 df["realized_vol_20d"] = df["daily_return"].rolling(20).std() * np.sqrt(252)
 
+# Synthetic option features
+
+# spot price
+df["spot"] = df["close"]
+
+# nearest ATM strike (round to nearest integer)
+df["strike"] = df["spot"].round()
+
+# days to expiration
+df["dte"] = 30
+
+# time to maturity (in years)
+df["T"] = 30 / 365
+
+# volatility (already computed)
+df["sigma"] = df["realized_vol_20d"]
+
+# risk-free rate
+df["r"] = 0.03
+
+# option type
+df["option_type"] = "call"
+
 # Save output
 df.to_csv("spy_with_features.csv", index=False)
 
