@@ -62,6 +62,29 @@ df["option_price_next"] = df.apply(
 )
 df["option_pnl"] = df["option_price_next"] - df["option_price"]
 df["option_pnl_contract"] = df["option_pnl"] * 100
+# Transaction cost per share
+cost_per_share = 0.01
+
+# Price change
+df["spot_change"] = df["spot_next"] - df["spot"]
+
+# Compute hedge P&L for each hedge bucket
+
+for h in HEDGE_BUCKETS:
+    suffix = int(h * 100)
+    
+    hedge_col = f"hedge_shares_{suffix}"
+    
+    # Hedge P&L
+    df[f"hedge_pnl_{suffix}"] = df[hedge_col] * df["spot_change"]
+    
+    # Transaction cost
+    df[f"hedge_cost_{suffix}"] = abs(df[hedge_col]) * cost_per_share
+    
+    # Net hedge P&L after cost
+    df[f"net_hedge_pnl_{suffix}"] = (
+        df[f"hedge_pnl_{suffix}"] - df[f"hedge_cost_{suffix}"]
+    )
 df.to_csv("spy_with_greeks.csv", index=False)
 # Save output
 df.to_csv("spy_black_scholes.csv", index=False)
