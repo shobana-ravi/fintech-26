@@ -44,6 +44,25 @@ df["portfolio_vega"] = df["vega"] * 100
 for h in HEDGE_BUCKETS:
     col_name = f"hedge_shares_{int(h*100)}"
     df[col_name] = -df["portfolio_delta"] * h
+    df["spot_next"] = df["spot"].shift(-1)
+df["sigma_next"] = df["sigma"].shift(-1)
+
+# DTE goes from 30 → 29
+df["dte_next"] = 29
+df["T_next"] = 29 / 365
+df["option_price_next"] = df.apply(
+    lambda row: black_scholes_call(
+        row["spot_next"],
+        row["strike"],
+        row["T_next"],
+        row["r"],
+        row["sigma_next"]
+    )[0] if pd.notnull(row["spot_next"]) else None,
+    axis=1
+)
+df["option_pnl"] = df["option_price_next"] - df["option_price"]
+df["option_pnl_contract"] = df["option_pnl"] * 100
+df.to_csv("spy_with_greeks.csv", index=False)
 # Save output
 df.to_csv("spy_black_scholes.csv", index=False)
 
