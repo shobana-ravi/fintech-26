@@ -39,9 +39,7 @@ def compute_option_pnl(input_csv, output_csv=None):
     T_next = 29 / 365
 
     # Recompute option price at t+1
-    price_next = black_scholes_call(S_next, K, T_next, r, sigma_next)
-
-    df["call_price_next"] = price_next
+    df["call_price_next"] = black_scholes_call(S_next, K, T_next, r, sigma_next)
 
     # Option PnL
     df["option_pnl"] = df["call_price_next"] - df["call_price"]
@@ -53,41 +51,65 @@ def compute_option_pnl(input_csv, output_csv=None):
     for ratio in HEDGE_BUCKETS:
         suffix = int(ratio * 100)
 
-        # Hedge shares
         hedge_shares = -df["delta"] * ratio
-
-        # Hedge PnL
         hedge_pnl = hedge_shares * (df["spot_next"] - df["spot"])
-
-        # Transaction cost
         hedge_cost = np.abs(hedge_shares) * COST_PER_SHARE
 
-        # Total PnL
         total_pnl = df["option_pnl_contract"] + hedge_pnl - hedge_cost
 
         col_name = f"total_pnl_{suffix}"
         df[col_name] = total_pnl
         total_pnl_cols.append(col_name)
 
-    # --- Choose best hedge ---
+    # Best hedge
     df["best_hedge_idx"] = df[total_pnl_cols].values.argmax(axis=1)
     df["target_hedge_ratio"] = HEDGE_BUCKETS[df["best_hedge_idx"]]
 
-    # Drop last row (no t+1 data)
+    # Drop last row (no next-day data)
     df = df.dropna()
 
-    # Output
-    if output_csv is None:
-        output_csv = input_csv.replace(".csv", "_final.csv")
+    # --- Step 10: Build final ML dataset ---
 
-    df.to_csv(output_csv, index=False)
-    print(f"Saved: {output_csv}")
+    # Rename for clarity
+    df = df.rename(columns={
+        "spot": "close",
+        "call_price": "option_price",
+        "target_hedge_ratio": "target_hedge_ratio_bucket"
+    })
+
+    # Final feature set (only keep what exists)
+    final_columns = [
+        "date",
+        "close",
+        "return_1d",
+        "return_5d",
+        "realized_vol_20d",
+        "strike",
+        "T",  # or replace with "dte" if needed
+        "option_price",
+        "delta",
+        "gamma",
+        "theta",
+        "vega",
+        "target_hedge_ratio_bucket"
+    ]
+
+    final_columns = [col for col in final_columns if col in df.columns]
+
+    df_final = df[final_columns].copy()
+
+    # Save output
+    if output_csv is None:
+        output_csv = "dia_ml_dataset.csv"
+
+    df_final.to_csv(output_csv, index=False)
+    print(f"Final ML dataset saved: {output_csv}")
 
 
 # --- CLI ---
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Compute option PnL, hedge PnL, and optimal hedge label for DIA"
+        description="Full pipeline: option PnL, hedge simulation, and ML dataset for DIA"
     )
     parser.add_argument(
         "input_csv",
