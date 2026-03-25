@@ -86,6 +86,29 @@ for h in HEDGE_BUCKETS:
         df[f"hedge_pnl_{suffix}"] - df[f"hedge_cost_{suffix}"]
     )
 df.to_csv("spy_with_greeks.csv", index=False)
+# Compute total P&L and choose best hedge
+
+def choose_best_hedge(row):
+    best_pnl = -np.inf
+    best_hedge = None
+    
+    for h in HEDGE_BUCKETS:
+        suffix = int(h * 100)
+        
+        total_pnl = (
+            row["option_pnl_contract"] +
+            row[f"hedge_pnl_{suffix}"] -
+            row[f"hedge_cost_{suffix}"]
+        )
+        
+        if total_pnl > best_pnl:
+            best_pnl = total_pnl
+            best_hedge = h
+    
+    return best_hedge
+
+# Apply to each row
+df["target_hedge_ratio_bucket"] = df.apply(choose_best_hedge, axis=1)
 # Save output
 df.to_csv("spy_black_scholes.csv", index=False)
 
