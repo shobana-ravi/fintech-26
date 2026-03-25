@@ -36,7 +36,10 @@ results = df.apply(
 )
 
 df[["option_price", "delta", "gamma", "theta", "vega"]] = pd.DataFrame(results.tolist(), index=df.index)
-
+df["portfolio_delta"] = df["delta"] * 100
+df["portfolio_gamma"] = df["gamma"] * 100
+df["portfolio_theta"] = df["theta"] * 100
+df["portfolio_vega"] = df["vega"] * 100
 # Save output
 df.to_csv("spy_black_scholes.csv", index=False)
 
