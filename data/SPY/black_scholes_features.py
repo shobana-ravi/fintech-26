@@ -1,6 +1,7 @@
 import pandas as pd
 import numpy as np
 from scipy.stats import norm
+HEDGE_BUCKETS = [0.00, 0.25, 0.50, 0.75, 1.00]
 
 # Load dataset
 df = pd.read_csv("spy_with_features.csv")
@@ -40,6 +41,9 @@ df["portfolio_delta"] = df["delta"] * 100
 df["portfolio_gamma"] = df["gamma"] * 100
 df["portfolio_theta"] = df["theta"] * 100
 df["portfolio_vega"] = df["vega"] * 100
+for h in HEDGE_BUCKETS:
+    col_name = f"hedge_shares_{int(h*100)}"
+    df[col_name] = -df["portfolio_delta"] * h
 # Save output
 df.to_csv("spy_black_scholes.csv", index=False)
 
