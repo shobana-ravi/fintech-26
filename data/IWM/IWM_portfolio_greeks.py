@@ -9,7 +9,6 @@ def black_scholes_call(S, K, T, r, sigma):
     """
     Returns: price, delta, gamma, theta, vega for a European call
     """
-
     sigma = np.where(sigma <= 0, 1e-8, sigma)
     T = np.where(T <= 0, 1e-8, T)
 
@@ -22,7 +21,7 @@ def black_scholes_call(S, K, T, r, sigma):
     vega = S * norm.pdf(d1) * np.sqrt(T)
 
     theta = (
-        -(S * norm.pdf(d1) * sigma) / (2 * np.sqrt(T))
+        - (S * norm.pdf(d1) * sigma) / (2 * np.sqrt(T))
         - r * K * np.exp(-r * T) * norm.cdf(d2)
     )
 
@@ -33,30 +32,27 @@ def compute_option_metrics(input_csv: str, output_csv: str | None = None):
 
     df = pd.read_csv(input_csv)
 
-    # Create option inputs
-    df["spot"] = df["close"]
-    df["strike"] = df["close"].round()
-    df["dte"] = 30
-    df["T"] = df["dte"] / 365
-    df["sigma"] = df["realized_vol_20d"]
-    df["r"] = 0.03
-    df["option_type"] = "call"
+    required_cols = ["spot", "strike", "T", "sigma"]
+    for col in required_cols:
+        if col not in df.columns:
+            raise ValueError(f"Missing required column: {col}")
 
     S = df["spot"].values
     K = df["strike"].values
     T = df["T"].values
     sigma = df["sigma"].values
-    r = df["r"].values
+    r = 0.03
 
     price, delta, gamma, theta, vega = black_scholes_call(S, K, T, r, sigma)
 
+    # Option Greeks
     df["call_price"] = price
     df["delta"] = delta
     df["gamma"] = gamma
     df["theta"] = theta
     df["vega"] = vega
 
-    # Portfolio Greeks (1 contract = 100 shares)
+    # Portfolio Greeks (1 option contract = 100 shares)
     df["portfolio_delta"] = df["delta"] * 100
     df["portfolio_gamma"] = df["gamma"] * 100
     df["portfolio_theta"] = df["theta"] * 100
@@ -79,8 +75,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "input_csv",
         nargs="?",
-        default=str(Path(__file__).resolve().parent / "IWM_data_features.csv"),
-        help="Path to IWM dataset CSV",
+        default=str(Path(__file__).resolve().parent / "iwm_us_d_with_metrics.csv"),
+        help="Path to IWM metrics CSV",
     )
 
     parser.add_argument(
