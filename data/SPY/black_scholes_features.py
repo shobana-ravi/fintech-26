@@ -44,6 +44,71 @@ df["portfolio_vega"] = df["vega"] * 100
 for h in HEDGE_BUCKETS:
     col_name = f"hedge_shares_{int(h*100)}"
     df[col_name] = -df["portfolio_delta"] * h
+    df["spot_next"] = df["spot"].shift(-1)
+df["sigma_next"] = df["sigma"].shift(-1)
+
+# DTE goes from 30 → 29
+df["dte_next"] = 29
+df["T_next"] = 29 / 365
+df["option_price_next"] = df.apply(
+    lambda row: black_scholes_call(
+        row["spot_next"],
+        row["strike"],
+        row["T_next"],
+        row["r"],
+        row["sigma_next"]
+    )[0] if pd.notnull(row["spot_next"]) else None,
+    axis=1
+)
+df["option_pnl"] = df["option_price_next"] - df["option_price"]
+df["option_pnl_contract"] = df["option_pnl"] * 100
+# Transaction cost per share
+cost_per_share = 0.01
+
+# Price change
+df["spot_change"] = df["spot_next"] - df["spot"]
+
+# Compute hedge P&L for each hedge bucket
+
+for h in HEDGE_BUCKETS:
+    suffix = int(h * 100)
+    
+    hedge_col = f"hedge_shares_{suffix}"
+    
+    # Hedge P&L
+    df[f"hedge_pnl_{suffix}"] = df[hedge_col] * df["spot_change"]
+    
+    # Transaction cost
+    df[f"hedge_cost_{suffix}"] = abs(df[hedge_col]) * cost_per_share
+    
+    # Net hedge P&L after cost
+    df[f"net_hedge_pnl_{suffix}"] = (
+        df[f"hedge_pnl_{suffix}"] - df[f"hedge_cost_{suffix}"]
+    )
+df.to_csv("spy_with_greeks.csv", index=False)
+# Compute total P&L and choose best hedge
+
+def choose_best_hedge(row):
+    best_pnl = -np.inf
+    best_hedge = None
+    
+    for h in HEDGE_BUCKETS:
+        suffix = int(h * 100)
+        
+        total_pnl = (
+            row["option_pnl_contract"] +
+            row[f"hedge_pnl_{suffix}"] -
+            row[f"hedge_cost_{suffix}"]
+        )
+        
+        if total_pnl > best_pnl:
+            best_pnl = total_pnl
+            best_hedge = h
+    
+    return best_hedge
+
+# Apply to each row
+df["target_hedge_ratio_bucket"] = df.apply(choose_best_hedge, axis=1)
 # Save output
 df.to_csv("spy_black_scholes.csv", index=False)
 
