@@ -6,13 +6,17 @@ import pandas as pd
 from scipy.stats import norm
 
 
+CONTRACT_SIZE = 100  # 1 option contract = 100 shares
+
+
 def black_scholes_call(S, K, T, r, sigma):
     """
-    Returns: price, delta, gamma, theta, vega
+    Returns:
+    price, delta, gamma, theta, vega
     """
 
-    # Avoid division errors
-    if sigma == 0 or T == 0:
+    # Handle edge cases
+    if pd.isna(sigma) or sigma == 0 or T == 0:
         return np.nan, np.nan, np.nan, np.nan, np.nan
 
     d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
@@ -44,6 +48,13 @@ def compute_options(input_csv: str, output_csv: str | None = None) -> Path:
 
     df = pd.read_csv(input_path)
 
+    # Remove duplicate columns (keep the first occurrence)
+    df = df.loc[:, ~df.columns.duplicated()]
+
+    print("Loaded file:", input_path.resolve())
+    print("Columns:", df.columns.tolist())
+
+    # --- VALIDATION ---
     required_cols = {"spot", "strike", "T", "sigma", "r"}
     missing = required_cols - set(df.columns)
     if missing:
@@ -66,6 +77,34 @@ def compute_options(input_csv: str, output_csv: str | None = None) -> Path:
 
     df = pd.concat([df, results], axis=1)
 
+    # --- PORTFOLIO GREEKS ---
+    df["portfolio_delta"] = df["delta"] * CONTRACT_SIZE
+    df["portfolio_gamma"] = df["gamma"] * CONTRACT_SIZE
+    df["portfolio_theta"] = df["theta"] * CONTRACT_SIZE
+    df["portfolio_vega"] = df["vega"] * CONTRACT_SIZE
+
+    # --- OPTIONAL: convert theta to daily (uncomment if desired) ---
+    # df["theta"] = df["theta"] / 365
+    # df["portfolio_theta"] = df["theta"] * CONTRACT_SIZE
+
+    # --- CLEAN COLUMN ORDER ---
+    cols = list(df.columns)
+
+    greek_cols = [
+        "option_price",
+        "delta",
+        "gamma",
+        "theta",
+        "vega",
+        "portfolio_delta",
+        "portfolio_gamma",
+        "portfolio_theta",
+        "portfolio_vega",
+    ]
+
+    ordered_cols = [c for c in cols if c not in greek_cols] + greek_cols
+    df = df[ordered_cols]
+
     # --- OUTPUT ---
     if output_csv is None:
         output_path = input_path.with_name(
@@ -81,14 +120,14 @@ def compute_options(input_csv: str, output_csv: str | None = None) -> Path:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Compute Black-Scholes price and Greeks for synthetic options."
+        description="Compute Black-Scholes prices, Greeks, and portfolio Greeks."
     )
 
     parser.add_argument(
         "input_csv",
         nargs="?",
         default="qqq_us_d_with_metrics.csv",
-        help="Input CSV with option inputs",
+        help="Input CSV with synthetic option inputs",
     )
 
     parser.add_argument(
