@@ -11,6 +11,7 @@ import argparse
 HEDGE_BUCKETS = np.array([0.00, 0.25, 0.50, 0.75, 1.00])
 COST_PER_SHARE = 0.01
 RISK_FREE_RATE = 0.03
+HEDGE_PENALTY_LAMBDA = 0.05
 
 
 # --------------------------------------------------
@@ -18,7 +19,6 @@ RISK_FREE_RATE = 0.03
 # --------------------------------------------------
 
 def black_scholes_call(S, K, T, r, sigma):
-
     sigma = np.where(sigma <= 0, 1e-8, sigma)
     T = np.where(T <= 0, 1e-8, T)
 
@@ -33,155 +33,199 @@ def black_scholes_call(S, K, T, r, sigma):
 # --------------------------------------------------
 
 def compute_option_pipeline(input_csv, output_csv=None):
-
     df = pd.read_csv(input_csv)
+    df.columns = [c.strip() for c in df.columns]
 
     print("Detected columns:", df.columns.tolist())
 
+    # Accept either close or spot_today
+    if "close" not in df.columns and "spot_today" not in df.columns:
+        raise ValueError("Need either 'close' or 'spot_today' column.")
+
+    if "close" not in df.columns and "spot_today" in df.columns:
+        df["close"] = df["spot_today"]
+
+    required = [
+        "date",
+        "close",
+        "return_1d",
+        "return_5d",
+        "realized_vol_20d",
+        "strike",
+        "T",
+        "call_price",
+        "delta",
+        "gamma",
+        "theta",
+        "vega",
+    ]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"Missing required columns: {missing}")
+
     # ---------------------------------------------
-    # Add constant column
+    # Base state
     # ---------------------------------------------
 
     df["cost_per_share"] = COST_PER_SHARE
 
-
-    # ---------------------------------------------
-    # STEP 7 — Reprice option next day
-    # ---------------------------------------------
-
     df["spot_today"] = df["close"]
-    df["spot_next"] = df["close"].shift(-1)
 
-    df["sigma_next"] = df["realized_vol_20d"].shift(-1)
+    if "spot_next" not in df.columns:
+        df["spot_next"] = df["close"].shift(-1)
 
-    df["dte_next"] = 29
-    df["T_next"] = df["dte_next"] / 365
+    if "sigma_next" not in df.columns:
+        df["sigma_next"] = df["realized_vol_20d"].shift(-1)
 
+    if "dte_today" not in df.columns:
+        df["dte_today"] = np.round(df["T"] * 365).astype(int)
 
-    df["call_price_next"] = black_scholes_call(
-        df["spot_next"],
-        df["strike"],
-        df["T_next"],
-        RISK_FREE_RATE,
-        df["sigma_next"]
-    )
+    if "dte_next" not in df.columns:
+        df["dte_next"] = df["dte_today"] - 1
 
+    if "T_next" not in df.columns:
+        df["T_next"] = df["dte_next"] / 365.0
 
-    # ---------------------------------------------
-    # Option PnL
-    # ---------------------------------------------
-
-    df["option_pnl"] = df["call_price_next"] - df["call_price"]
-
-    df["option_pnl_contract"] = df["option_pnl"] * 100
-
+    # Portfolio greeks for 1 contract
+    df["portfolio_delta"] = df["delta"] * 100
+    df["portfolio_gamma"] = df["gamma"] * 100
+    df["portfolio_theta"] = df["theta"] * 100
+    df["portfolio_vega"] = df["vega"] * 100
 
     # ---------------------------------------------
-    # STEP 8 — Hedge PnL
+    # Reprice option next day if missing
     # ---------------------------------------------
 
-    total_pnl_cols = []
+    if "call_price_next" not in df.columns:
+        df["call_price_next"] = black_scholes_call(
+            df["spot_next"],
+            df["strike"],
+            df["T_next"],
+            RISK_FREE_RATE,
+            df["sigma_next"]
+        )
+
+    # ---------------------------------------------
+    # Option PnL if missing
+    # ---------------------------------------------
+
+    if "option_pnl" not in df.columns:
+        df["option_pnl"] = df["call_price_next"] - df["call_price"]
+
+    if "option_pnl_contract" not in df.columns:
+        df["option_pnl_contract"] = df["option_pnl"] * 100
+
+    df["spot_change"] = df["spot_next"] - df["spot_today"]
+
+    # ---------------------------------------------
+    # Hedge calculations
+    # ---------------------------------------------
+
+    score_cols = []
 
     for ratio in HEDGE_BUCKETS:
-
         suffix = int(ratio * 100)
 
-        # hedge position
-        df[f"hedge_shares_{suffix}"] = -df["delta"] * ratio
+        hedge_shares_col = f"hedge_shares_{suffix}"
+        hedge_pnl_col = f"hedge_pnl_{suffix}"
+        hedge_cost_col = f"hedge_cost_{suffix}"
+        total_pnl_col = f"total_pnl_{suffix}"
+        score_col = f"score_{suffix}"
 
-        # hedge pnl
-        df[f"hedge_pnl_{suffix}"] = (
-            df[f"hedge_shares_{suffix}"] *
-            (df["spot_next"] - df["spot_today"])
-        )
+        # Use contract delta exposure
+        df[hedge_shares_col] = -df["portfolio_delta"] * ratio
 
-        # hedge transaction cost
-        df[f"hedge_cost_{suffix}"] = (
-            np.abs(df[f"hedge_shares_{suffix}"]) *
-            df["cost_per_share"]
-        )
+        df[hedge_pnl_col] = df[hedge_shares_col] * df["spot_change"]
+        df[hedge_cost_col] = np.abs(df[hedge_shares_col]) * df["cost_per_share"]
 
-        # total pnl
-        df[f"total_pnl_{suffix}"] = (
+        df[total_pnl_col] = (
             df["option_pnl_contract"]
-            + df[f"hedge_pnl_{suffix}"]
-            - df[f"hedge_cost_{suffix}"]
+            + df[hedge_pnl_col]
+            - df[hedge_cost_col]
         )
 
-        total_pnl_cols.append(f"total_pnl_{suffix}")
+        # Risk-reduction score instead of raw profit max
+        df[score_col] = (
+            -np.abs(df[total_pnl_col])
+            - HEDGE_PENALTY_LAMBDA * np.abs(df[hedge_shares_col])
+        )
 
+        score_cols.append(score_col)
 
     # ---------------------------------------------
-    # STEP 9 — Label creation
+    # Label creation
     # ---------------------------------------------
 
-    df["best_hedge_idx"] = df[total_pnl_cols].values.argmax(axis=1)
-
+    df["best_hedge_idx"] = df[score_cols].values.argmax(axis=1)
     df["target_hedge_ratio_bucket"] = HEDGE_BUCKETS[df["best_hedge_idx"]]
+    df["target_class"] = df["best_hedge_idx"]
 
-
-    # Remove last row (no t+1 data)
-    df = df.dropna()
-
+    # Remove last row / incomplete rows
+    df = df.dropna().reset_index(drop=True)
 
     # ---------------------------------------------
     # Final dataset columns
     # ---------------------------------------------
 
     final_columns = [
-
         "date",
-
         "spot_today",
         "spot_next",
-
         "return_1d",
         "return_5d",
-
         "realized_vol_20d",
         "sigma_next",
-
         "strike",
         "T",
+        "dte_today",
         "dte_next",
         "T_next",
-
         "call_price",
         "call_price_next",
-
         "delta",
         "gamma",
         "theta",
         "vega",
-
+        "portfolio_delta",
+        "portfolio_gamma",
+        "portfolio_theta",
+        "portfolio_vega",
         "option_pnl",
         "option_pnl_contract",
-
         "cost_per_share",
-
-        # total pnl columns
+        "hedge_shares_0",
+        "hedge_shares_25",
+        "hedge_shares_50",
+        "hedge_shares_75",
+        "hedge_shares_100",
         "total_pnl_0",
         "total_pnl_25",
         "total_pnl_50",
         "total_pnl_75",
         "total_pnl_100",
-
-        # ML label
-        "target_hedge_ratio_bucket"
+        "score_0",
+        "score_25",
+        "score_50",
+        "score_75",
+        "score_100",
+        "best_hedge_idx",
+        "target_hedge_ratio_bucket",
+        "target_class",
     ]
 
     final_columns = [c for c in final_columns if c in df.columns]
-
     df_final = df[final_columns].copy()
-
 
     if output_csv is None:
         output_csv = "iwm_ml_dataset.csv"
 
-
     df_final.to_csv(output_csv, index=False)
 
     print("Final ML dataset saved:", output_csv)
+    print("\nTarget hedge ratio distribution:")
+    print(df_final["target_hedge_ratio_bucket"].value_counts().sort_index())
+    print("\nTarget class distribution:")
+    print(df_final["target_class"].value_counts().sort_index())
 
 
 # --------------------------------------------------
@@ -189,7 +233,6 @@ def compute_option_pipeline(input_csv, output_csv=None):
 # --------------------------------------------------
 
 if __name__ == "__main__":
-
     parser = argparse.ArgumentParser(
         description="IWM Option Repricing + Hedge Simulation + ML Dataset"
     )
