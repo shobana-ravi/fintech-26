@@ -4,7 +4,7 @@ import numpy as np
 # --------------------------------------------------------------------
 # Config
 # --------------------------------------------------------------------
-DATA_PATH = "qqq_us_d_with_synthetic_data_with_greeks_portfolio_training_dataset.csv"  # adjust if needed
+DATA_PATH = "qqq_training_dataset_fixed.csv"  # adjust if needed
 HEDGE_BUCKETS = [0.00, 0.25, 0.50, 0.75, 1.00]
 
 # --------------------------------------------------------------------
