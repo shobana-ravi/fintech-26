@@ -35,16 +35,23 @@ def compute_option_pnl(input_csv, output_csv=None):
         raise ValueError(f"Missing required columns: {missing}")
 
     # --- Step 7: Reprice next day ---
-    df["spot_next"] = df["spot"].shift(-1)
+    df["spot_today"] = df["spot"]
+    df["spot_next"] = df["spot_today"].shift(-1)
     df["sigma_next"] = df["sigma"].shift(-1)
 
-    T_next = 29 / 365
+    if "dte" in df.columns:
+        df["dte_today"] = pd.to_numeric(df["dte"], errors="coerce")
+    else:
+        df["dte_today"] = np.round(df["T"] * 365)
+    df["dte_today"] = df["dte_today"].fillna(np.round(df["T"] * 365)).astype(int)
+    df["dte_next"] = df["dte_today"] - 1
+    df["T_next"] = df["dte_next"] / 365.0
 
     # Recompute option price at t+1
     df["call_price_next"] = black_scholes_call(
         df["spot_next"],
         df["strike"],
-        T_next,
+        df["T_next"],
         RISK_FREE_RATE,
         df["sigma_next"]
     )
@@ -79,7 +86,7 @@ def compute_option_pnl(input_csv, output_csv=None):
         # IMPORTANT: use contract-scaled delta exposure
         df[hedge_shares_col] = -df["portfolio_delta"] * ratio
 
-        df[hedge_pnl_col] = df[hedge_shares_col] * (df["spot_next"] - df["spot"])
+        df[hedge_pnl_col] = df[hedge_shares_col] * (df["spot_next"] - df["spot_today"])
         df[hedge_cost_col] = np.abs(df[hedge_shares_col]) * COST_PER_SHARE
 
         df[total_pnl_col] = (
@@ -107,20 +114,21 @@ def compute_option_pnl(input_csv, output_csv=None):
     df = df.dropna().reset_index(drop=True)
 
     # --- Step 10: Build final ML dataset ---
-    df = df.rename(columns={
-        "spot": "close",
-        "call_price": "option_price"
-    })
-
     final_columns = [
         "date",
-        "close",
+        "spot_today",
+        "spot_next",
         "return_1d",
         "return_5d",
         "realized_vol_20d",
+        "sigma_next",
         "strike",
         "T",
-        "option_price",
+        "dte_today",
+        "dte_next",
+        "T_next",
+        "call_price",
+        "call_price_next",
         "delta",
         "gamma",
         "theta",
@@ -129,6 +137,8 @@ def compute_option_pnl(input_csv, output_csv=None):
         "portfolio_gamma",
         "portfolio_theta",
         "portfolio_vega",
+        "option_pnl",
+        "option_pnl_contract",
         "target_hedge_ratio_bucket",
         "target_class"
     ]
