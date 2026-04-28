@@ -10,15 +10,12 @@ import argparse
 HEDGE_BUCKETS = [0.00, 0.25, 0.50, 0.75, 1.00]
 COST_PER_SHARE = 0.01
 CONTRACT_SIZE = 100
-HEDGE_PENALTY_LAMBDA = 0.05   # increase to 0.10 or 0.20 if you still get too many 1.00 labels
+HEDGE_PENALTY_LAMBDA = 0.05
 
 # -----------------------------
 # Black-Scholes function
 # -----------------------------
 def black_scholes_call(S, K, T, r, sigma):
-    """
-    Returns: price, delta, gamma, theta, vega
-    """
     if pd.isna(S) or pd.isna(K) or pd.isna(T) or pd.isna(r) or pd.isna(sigma):
         return np.nan, np.nan, np.nan, np.nan, np.nan
 
@@ -53,146 +50,133 @@ def generate_training_dataset(input_csv: str, output_csv=None):
     df.columns = [c.strip() for c in df.columns]
     df.rename(columns={"Date": "date", "Close": "close"}, inplace=True)
 
-    required_cols = [
-        "date",
-        "close",
-        "return_1d",
-        "return_5d",
-        "realized_vol_20d",
-        "strike",
-        "dte",
-        "r",
-        "option_price",
-        "delta",
-        "gamma",
-        "theta",
-        "vega",
-        "portfolio_delta",
-        "portfolio_gamma",
-        "portfolio_theta",
-        "portfolio_vega",
-    ]
-    missing = [c for c in required_cols if c not in df.columns]
-    if missing:
-        raise ValueError(f"Missing required columns: {missing}")
-
     # -----------------------------
-    # Step 7: compute next-day option price
+    # Forward-looking values
     # -----------------------------
-    df["option_price_next"] = np.nan
     df["spot_next"] = df["close"].shift(-1)
     df["sigma_next"] = df["realized_vol_20d"].shift(-1)
 
-    for t in range(len(df) - 1):
-        spot_next = df.loc[t + 1, "close"]
-        K = df.loc[t, "strike"]
-        T_next = (df.loc[t, "dte"] - 1) / 365
-        r = df.loc[t, "r"]
-        sigma_next = df.loc[t + 1, "realized_vol_20d"]
+    df["option_price_next"] = np.nan
 
+    for t in range(len(df) - 1):
         df.loc[t, "option_price_next"] = black_scholes_call(
-            spot_next, K, T_next, r, sigma_next
+            df.loc[t + 1, "close"],
+            df.loc[t, "strike"],
+            (df.loc[t, "dte"] - 1) / 365,
+            df.loc[t, "r"],
+            df.loc[t + 1, "realized_vol_20d"]
         )[0]
 
     # -----------------------------
-    # Step 8: option P&L
+    # Option PnL
     # -----------------------------
-    df["option_pnl_contract"] = (df["option_price_next"] - df["option_price"]) * CONTRACT_SIZE
+    df["option_pnl_contract"] = (
+        df["option_price_next"] - df["option_price"]
+    ) * CONTRACT_SIZE
 
     # -----------------------------
-    # Step 8: compute hedge outcomes
+    # Hedge simulation
     # -----------------------------
     for hedge_ratio in HEDGE_BUCKETS:
         suffix = int(hedge_ratio * 100)
 
-        # IMPORTANT:
-        # portfolio_delta is already contract-scaled in your pipeline
-        hedge_shares_col = f"hedge_shares_{suffix}"
-        hedge_pnl_col = f"hedge_pnl_{suffix}"
-        hedge_cost_col = f"hedge_cost_{suffix}"
-        total_pnl_col = f"total_pnl_{suffix}"
-        score_col = f"score_{suffix}"
+        shares = -df["portfolio_delta"] * hedge_ratio
 
-        df[hedge_shares_col] = -df["portfolio_delta"] * hedge_ratio
-        df[hedge_pnl_col] = df[hedge_shares_col] * (df["spot_next"] - df["close"])
-        df[hedge_cost_col] = np.abs(df[hedge_shares_col]) * COST_PER_SHARE
-        df[total_pnl_col] = df["option_pnl_contract"] + df[hedge_pnl_col] - df[hedge_cost_col]
+        df[f"total_pnl_{suffix}"] = (
+            df["option_pnl_contract"]
+            + shares * (df["spot_next"] - df["close"])
+            - np.abs(shares) * COST_PER_SHARE
+        )
 
-        # NEW:
-        # choose hedge that reduces next-day net swing,
-        # with a mild penalty for oversized hedges
-        df[score_col] = (
-            -np.abs(df[total_pnl_col])
-            - HEDGE_PENALTY_LAMBDA * np.abs(df[hedge_shares_col])
+        df[f"score_{suffix}"] = (
+            -np.abs(df[f"total_pnl_{suffix}"])
+            - HEDGE_PENALTY_LAMBDA * np.abs(shares)
         )
 
     # -----------------------------
-    # Step 9: select best hedge ratio
+    # Label selection
     # -----------------------------
-    target_buckets = []
-    target_classes = []
+    targets = []
+    classes = []
 
     for t in range(len(df)):
-        scores_today = [df.loc[t, f"score_{int(bucket * 100)}"] for bucket in HEDGE_BUCKETS]
+        scores = [df.loc[t, f"score_{int(b * 100)}"] for b in HEDGE_BUCKETS]
 
-        if all(pd.isna(scores_today)):
-            target_buckets.append(np.nan)
-            target_classes.append(np.nan)
+        if all(pd.isna(scores)):
+            targets.append(np.nan)
+            classes.append(np.nan)
         else:
-            best_idx = np.nanargmax(scores_today)
-            target_buckets.append(HEDGE_BUCKETS[best_idx])
-            target_classes.append(best_idx)
+            idx = np.nanargmax(scores)
+            targets.append(HEDGE_BUCKETS[idx])
+            classes.append(idx)
 
-    df["target_hedge_ratio_bucket"] = target_buckets
-    df["target_class"] = target_classes
+    df["target_hedge_ratio_bucket"] = targets
+    df["target_class"] = classes
 
     # -----------------------------
-    # Step 10: build final training dataset
+    # Final dataset (FIXED)
     # -----------------------------
-    final_columns = [
-        "date",
-        "close",
-        "return_1d",
-        "return_5d",
-        "realized_vol_20d",
-        "strike",
-        "dte",
-        "option_price",
-        "delta",
-        "gamma",
-        "theta",
-        "vega",
-        "portfolio_delta",
-        "portfolio_gamma",
-        "portfolio_theta",
-        "portfolio_vega",
-        "target_hedge_ratio_bucket",
-        "target_class",
-    ]
+    training_df = df[
+        [
+            "date",
+            "close",
+            "spot_next",
+            "return_1d",
+            "return_5d",
+            "realized_vol_20d",
+            "sigma_next",
+            "strike",
+            "dte",
+            "option_price",
+            "option_price_next",
+            "delta",
+            "gamma",
+            "theta",
+            "vega",
+            "portfolio_delta",
+            "portfolio_gamma",
+            "portfolio_theta",
+            "portfolio_vega",
+            "option_pnl_contract",
+            "target_hedge_ratio_bucket",
+            "target_class",
+        ]
+    ].dropna().reset_index(drop=True)
 
-    training_df = df[final_columns].dropna().reset_index(drop=True)
+    # -----------------------------
+    # Rename to match model
+    # -----------------------------
+    training_df = training_df.rename(columns={
+        "close": "spot_today",
+        "dte": "dte_today",
+        "option_price": "call_price",
+        "option_pnl_contract": "option_pnl",
+    })
 
+    # Add T
+    training_df["T"] = training_df["dte_today"] / 365
+
+    # -----------------------------
+    # Save
+    # -----------------------------
     if output_csv is None:
         output_path = input_path.with_name(f"{input_path.stem}_training_dataset.csv")
     else:
         output_path = Path(output_csv)
 
     training_df.to_csv(output_path, index=False)
+
     print(f"Training dataset saved to: {output_path}")
-
-    print("\nTarget hedge ratio distribution:")
-    print(training_df["target_hedge_ratio_bucket"].value_counts().sort_index())
-
-    print("\nTarget class distribution:")
-    print(training_df["target_class"].value_counts().sort_index())
+    print("\nClass distribution:")
+    print(training_df["target_class"].value_counts())
 
 # -----------------------------
 # CLI
 # -----------------------------
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Generate training dataset with hedge labels")
-    parser.add_argument("input_csv", help="CSV file with portfolio Greeks")
-    parser.add_argument("-o", "--output", default=None, help="Optional output CSV path")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("input_csv")
+    parser.add_argument("-o", "--output", default=None)
     args = parser.parse_args()
 
     generate_training_dataset(args.input_csv, args.output)
