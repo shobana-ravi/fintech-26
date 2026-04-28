@@ -4,6 +4,7 @@ import os
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
+from uuid import uuid4
 
 import joblib
 import pandas as pd
@@ -14,6 +15,7 @@ DIA_CSV_PATH = Path(__file__).resolve().parents[2] / "data" / "dia_us_d.csv"
 IWM_CSV_PATH = Path(__file__).resolve().parents[2] / "data" / "IWM_data.csv"
 QQQ_CSV_PATH = Path(__file__).resolve().parents[2] / "data" / "qqq_us_d.csv"
 SPY_CSV_PATH = Path(__file__).resolve().parents[2] / "data" / "spy_us_d.csv"
+PAPER_ORDERS_PATH = Path(__file__).resolve().parents[1] / "data" / "paper_orders.json"
 HOST = "0.0.0.0"
 PORT = 8000
 DEBUG_LOG_PATH = Path("/Users/boppa/fintech-26/.cursor/debug-d5969c.log")
@@ -209,6 +211,31 @@ QUOTE_SERVICE = QuoteService(
 )
 
 
+def load_paper_orders(path: Path):
+    if not path.exists():
+        return []
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (json.JSONDecodeError, OSError):
+        return []
+    if not isinstance(data, list):
+        return []
+    return [entry for entry in data if isinstance(entry, dict)]
+
+
+def save_paper_orders(path: Path, orders: list):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_suffix(".tmp")
+    with temp_path.open("w", encoding="utf-8") as handle:
+        json.dump(orders, handle)
+    temp_path.replace(path)
+
+
+PAPER_ORDERS = load_paper_orders(PAPER_ORDERS_PATH)
+SUPPORTED_TICKERS = {"SPY", "QQQ", "DIA", "IWM"}
+
+
 class HedgeRequestHandler(BaseHTTPRequestHandler):
     def _send_json(self, status: int, payload: dict):
         encoded = json.dumps(payload).encode("utf-8")
@@ -274,26 +301,91 @@ class HedgeRequestHandler(BaseHTTPRequestHandler):
             except Exception as err:
                 self._send_json(500, {"error": f"History lookup failed: {err}"})
             return
+        if parsed.path == "/api/orders/paper":
+            query_params = parse_qs(parsed.query)
+            raw_limit = query_params.get("limit", ["20"])[0]
+            try:
+                limit = int(raw_limit)
+            except ValueError:
+                self._send_json(400, {"error": "limit must be an integer"})
+                return
+            if limit <= 0:
+                self._send_json(400, {"error": "limit must be a positive integer"})
+                return
+            self._send_json(200, {"orders": PAPER_ORDERS[-limit:]})
+            return
 
         self._send_json(404, {"error": "Not found"})
 
     def do_POST(self):
-        if self.path != "/api/hedge/recommend":
-            self._send_json(404, {"error": "Not found"})
+        if self.path == "/api/hedge/recommend":
+            try:
+                content_length = int(self.headers.get("Content-Length", 0))
+                raw = self.rfile.read(content_length).decode("utf-8")
+                payload = json.loads(raw) if raw else {}
+                prediction = MODEL_SERVICE.predict(payload)
+                self._send_json(200, prediction)
+            except json.JSONDecodeError:
+                self._send_json(400, {"error": "Invalid JSON payload"})
+            except ValueError as err:
+                self._send_json(400, {"error": str(err)})
+            except Exception as err:
+                self._send_json(500, {"error": f"Inference failed: {err}"})
             return
 
-        try:
-            content_length = int(self.headers.get("Content-Length", 0))
-            raw = self.rfile.read(content_length).decode("utf-8")
-            payload = json.loads(raw) if raw else {}
-            prediction = MODEL_SERVICE.predict(payload)
-            self._send_json(200, prediction)
-        except json.JSONDecodeError:
-            self._send_json(400, {"error": "Invalid JSON payload"})
-        except ValueError as err:
-            self._send_json(400, {"error": str(err)})
-        except Exception as err:
-            self._send_json(500, {"error": f"Inference failed: {err}"})
+        if self.path == "/api/orders/paper":
+            try:
+                content_length = int(self.headers.get("Content-Length", 0))
+                raw = self.rfile.read(content_length).decode("utf-8")
+                payload = json.loads(raw) if raw else {}
+            except json.JSONDecodeError:
+                self._send_json(400, {"error": "Invalid JSON payload"})
+                return
+
+            ticker = str(payload.get("ticker", "")).upper()
+            side = str(payload.get("side", "")).lower()
+            try:
+                quantity = int(payload.get("quantity", 0))
+            except (TypeError, ValueError):
+                self._send_json(400, {"error": "quantity must be an integer"})
+                return
+
+            try:
+                hedge_percent = float(payload.get("hedge_percent", 0))
+                price = float(payload.get("price", 0))
+            except (TypeError, ValueError):
+                self._send_json(400, {"error": "hedge_percent and price must be numeric"})
+                return
+
+            if ticker not in SUPPORTED_TICKERS:
+                self._send_json(400, {"error": f"Unsupported ticker: {ticker}"})
+                return
+            if side not in {"buy", "sell"}:
+                self._send_json(400, {"error": "side must be buy or sell"})
+                return
+            if quantity <= 0:
+                self._send_json(400, {"error": "quantity must be a positive integer"})
+                return
+            if price <= 0:
+                self._send_json(400, {"error": "price must be positive"})
+                return
+
+            order = {
+                "order_id": f"paper_{uuid4().hex[:12]}",
+                "status": "filled",
+                "ticker": ticker,
+                "side": side,
+                "quantity": quantity,
+                "hedge_percent": hedge_percent,
+                "filled_price": round(price, 4),
+                "filled_at": pd.Timestamp.now("UTC").isoformat(),
+            }
+            PAPER_ORDERS.append(order)
+            save_paper_orders(PAPER_ORDERS_PATH, PAPER_ORDERS)
+            self._send_json(200, order)
+            return
+
+        self._send_json(404, {"error": "Not found"})
 
 
 def parse_args():

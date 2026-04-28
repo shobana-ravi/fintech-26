@@ -16,7 +16,7 @@ import {
   Layers,
   Zap
 } from 'lucide-react';
-import { getHedgeRecommendation, getQuote, getHistory } from './services/hedgeApi';
+import { getHedgeRecommendation, getQuote, getHistory, placePaperOrder, getPaperOrders } from './services/hedgeApi';
 
 const HedgeDashboard = () => {
   // State for parameters
@@ -29,6 +29,10 @@ const HedgeDashboard = () => {
   const [quoteError, setQuoteError] = useState('');
   const [historyData, setHistoryData] = useState([]);
   const [historyError, setHistoryError] = useState('');
+  const [isExecuting, setIsExecuting] = useState(false);
+  const [executeMessage, setExecuteMessage] = useState('');
+  const [executeError, setExecuteError] = useState('');
+  const [paperOrders, setPaperOrders] = useState([]);
   
   // Ticker price data
   const tickerPrices = { 
@@ -102,6 +106,26 @@ const HedgeDashboard = () => {
       isCancelled = true;
     };
   }, [isCsvBackedTicker, ticker]);
+
+  useEffect(() => {
+    let isCancelled = false;
+    const loadPaperOrders = async () => {
+      try {
+        const data = await getPaperOrders(5);
+        if (!isCancelled) {
+          setPaperOrders(Array.isArray(data.orders) ? data.orders : []);
+        }
+      } catch (_error) {
+        if (!isCancelled) {
+          setPaperOrders([]);
+        }
+      }
+    };
+    loadPaperOrders();
+    return () => {
+      isCancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     if (!isCsvBackedTicker) {
@@ -193,6 +217,31 @@ const HedgeDashboard = () => {
       setPredictionError(error.message || 'Could not fetch recommendation');
     } finally {
       setIsUpdating(false);
+    }
+  };
+
+  const handleExecute = async () => {
+    setIsExecuting(true);
+    setExecuteMessage('');
+    setExecuteError('');
+    try {
+      const side = sharesToHedge.action.toLowerCase() === 'sell' ? 'sell' : 'buy';
+      const order = await placePaperOrder({
+        ticker,
+        side,
+        quantity: sharesToHedge.count,
+        hedge_percent: recomHedge,
+        price: displayedPrice,
+      });
+      setExecuteMessage(
+        `Paper order filled: ${order.side.toUpperCase()} ${order.quantity} ${order.ticker} @ $${Number(order.filled_price).toFixed(2)}`,
+      );
+      const ordersResponse = await getPaperOrders(5);
+      setPaperOrders(Array.isArray(ordersResponse.orders) ? ordersResponse.orders : []);
+    } catch (error) {
+      setExecuteError(error.message || 'Paper trade failed');
+    } finally {
+      setIsExecuting(false);
     }
   };
 
@@ -345,9 +394,38 @@ const HedgeDashboard = () => {
                     <p className="text-2xl font-bold">{sharesToHedge.action} {sharesToHedge.count} Shares of {ticker}</p>
                   </div>
                 </div>
-                <button className="bg-white text-slate-900 px-10 py-4 rounded-2xl font-black text-sm hover:bg-indigo-50 transition-all active:scale-95 shadow-xl">
-                  EXECUTE
+                <button
+                  onClick={handleExecute}
+                  disabled={isExecuting}
+                  className="bg-white text-slate-900 px-10 py-4 rounded-2xl font-black text-sm hover:bg-indigo-50 transition-all active:scale-95 shadow-xl disabled:opacity-70"
+                >
+                  {isExecuting ? 'EXECUTING...' : 'EXECUTE'}
                 </button>
+              </div>
+              {executeMessage && (
+                <p className="mt-4 text-xs font-semibold text-emerald-600">{executeMessage}</p>
+              )}
+              {executeError && (
+                <p className="mt-4 text-xs font-semibold text-rose-600">{executeError}</p>
+              )}
+            </div>
+
+            <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-6">
+              <h3 className="font-bold text-slate-700 text-sm mb-4">Recent Paper Trades</h3>
+              <div className="space-y-3">
+                {paperOrders.length === 0 && (
+                  <p className="text-xs font-medium text-slate-400">No paper orders yet.</p>
+                )}
+                {paperOrders.slice().reverse().map((order) => (
+                  <div key={order.order_id} className="flex items-center justify-between text-xs border border-slate-100 rounded-xl p-3 bg-slate-50">
+                    <div className="font-semibold text-slate-700">
+                      {order.side?.toUpperCase()} {order.quantity} {order.ticker}
+                    </div>
+                    <div className="text-slate-500">
+                      ${Number(order.filled_price).toFixed(2)} · {order.status}
+                    </div>
+                  </div>
+                ))}
               </div>
             </div>
 
