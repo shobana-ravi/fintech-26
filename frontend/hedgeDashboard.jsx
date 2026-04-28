@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import { 
   XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, AreaChart, Area,
   BarChart, Bar, Cell
@@ -16,7 +16,7 @@ import {
   Layers,
   Zap
 } from 'lucide-react';
-import { getHedgeRecommendation } from './services/hedgeApi';
+import { getHedgeRecommendation, getQuote, getHistory } from './services/hedgeApi';
 
 const HedgeDashboard = () => {
   // State for parameters
@@ -24,6 +24,11 @@ const HedgeDashboard = () => {
   const [isUpdating, setIsUpdating] = useState(false);
   const [predictionError, setPredictionError] = useState('');
   const [predictionConfidence, setPredictionConfidence] = useState(null);
+  const [tickerQuote, setTickerQuote] = useState(null);
+  const [isQuoteLoading, setIsQuoteLoading] = useState(false);
+  const [quoteError, setQuoteError] = useState('');
+  const [historyData, setHistoryData] = useState([]);
+  const [historyError, setHistoryError] = useState('');
   
   // Ticker price data
   const tickerPrices = { 
@@ -33,6 +38,13 @@ const HedgeDashboard = () => {
     'IWM': 204.12 
   };
   const currentPrice = tickerPrices[ticker];
+  const csvBackedTickers = new Set(['DIA', 'IWM', 'QQQ', 'SPY']);
+  const isCsvBackedTicker = csvBackedTickers.has(ticker);
+  const displayedPrice = isCsvBackedTicker && tickerQuote?.price ? tickerQuote.price : currentPrice;
+  const displayedChangePct =
+    isCsvBackedTicker && tickerQuote?.change_pct !== undefined ? tickerQuote.change_pct : 0.15;
+  const changeText = `${displayedChangePct >= 0 ? '+' : ''}${displayedChangePct.toFixed(2)}%`;
+  const changeColor = displayedChangePct >= 0 ? 'text-green-600' : 'text-rose-600';
   
   // The Model Output (0, 25, 50, 75, 100)
   const [recomHedge, setRecomHedge] = useState(50); 
@@ -49,14 +61,82 @@ const HedgeDashboard = () => {
     return { count: targetHedgeAmount, action: 'Sell' };
   }, [recomHedge]);
 
-  // Mock historical data for charts
-  const chartData = useMemo(() => {
+  const fallbackChartData = useMemo(() => {
     return Array.from({ length: 15 }, (_, i) => ({
       date: `Day ${i + 1}`,
-      price: currentPrice - 5 + Math.random() * 10,
-      suggestedHedge: [0, 25, 50, 75, 100][Math.floor(Math.random() * 5)]
+      close: displayedPrice,
+      hedge_intensity: 0,
     }));
-  }, [ticker, currentPrice]);
+  }, [ticker, displayedPrice]);
+  const chartData = historyData.length > 0 ? historyData : fallbackChartData;
+
+  useEffect(() => {
+    if (!isCsvBackedTicker) {
+      setTickerQuote(null);
+      setQuoteError('');
+      return;
+    }
+
+    let isCancelled = false;
+    const loadTickerQuote = async () => {
+      setIsQuoteLoading(true);
+      setQuoteError('');
+      try {
+        const quote = await getQuote(ticker);
+        if (!isCancelled) {
+          setTickerQuote(quote);
+        }
+      } catch (error) {
+        if (!isCancelled) {
+          setQuoteError(error.message || `Could not fetch ${ticker} quote`);
+        }
+      } finally {
+        if (!isCancelled) {
+          setIsQuoteLoading(false);
+        }
+      }
+    };
+
+    loadTickerQuote();
+    return () => {
+      isCancelled = true;
+    };
+  }, [isCsvBackedTicker, ticker]);
+
+  useEffect(() => {
+    if (!isCsvBackedTicker) {
+      setHistoryData([]);
+      setHistoryError('');
+      return;
+    }
+
+    let isCancelled = false;
+    const loadHistory = async () => {
+      setHistoryError('');
+      try {
+        const history = await getHistory(ticker, 15);
+        if (!isCancelled) {
+          setHistoryData(
+            (history.points || []).map((point) => ({
+              date: point.date,
+              close: point.close,
+              hedge_intensity: point.hedge_intensity,
+            })),
+          );
+        }
+      } catch (error) {
+        if (!isCancelled) {
+          setHistoryError(error.message || `Could not fetch ${ticker} history`);
+          setHistoryData([]);
+        }
+      }
+    };
+
+    loadHistory();
+    return () => {
+      isCancelled = true;
+    };
+  }, [isCsvBackedTicker, ticker]);
 
   const hedgeOptions = [
     { value: 0, label: '0% hedge' },
@@ -66,18 +146,19 @@ const HedgeDashboard = () => {
     { value: 100, label: '100% hedge' },
   ];
 
-  const buildFeaturePayload = () => {
-    const strike = Math.round(currentPrice);
+  const buildFeaturePayload = (priceOverride = null) => {
+    const effectivePrice = typeof priceOverride === 'number' ? priceOverride : displayedPrice;
+    const strike = Math.round(effectivePrice);
 
     return {
       ticker,
-      close: currentPrice,
+      close: effectivePrice,
       return_1d: 0.0,
       return_5d: 0.0,
       realized_vol_20d: 0.2,
       strike,
       T: dte / 365,
-      option_price: Math.max(currentPrice * 0.02, 0.01),
+      option_price: Math.max(effectivePrice * 0.02, 0.01),
       delta: 0.5,
       gamma: 0.15,
       theta: -6.0,
@@ -90,7 +171,22 @@ const HedgeDashboard = () => {
     setPredictionError('');
 
     try {
-      const prediction = await getHedgeRecommendation(buildFeaturePayload());
+      let payloadPrice = null;
+      if (isCsvBackedTicker) {
+        try {
+          setIsQuoteLoading(true);
+          setQuoteError('');
+          const quote = await getQuote(ticker);
+          setTickerQuote(quote);
+          payloadPrice = quote.price;
+        } catch (error) {
+          setQuoteError(error.message || `Could not fetch ${ticker} quote`);
+        } finally {
+          setIsQuoteLoading(false);
+        }
+      }
+
+      const prediction = await getHedgeRecommendation(buildFeaturePayload(payloadPrice));
       setRecomHedge(Math.round(Number(prediction.predicted_hedge_ratio_bucket) * 100));
       setPredictionConfidence(prediction.prediction_confidence);
     } catch (error) {
@@ -183,9 +279,18 @@ const HedgeDashboard = () => {
             <div className="bg-white rounded-2xl border border-slate-200 p-6 shadow-sm">
               <p className="text-xs font-bold text-slate-400 uppercase tracking-widest mb-1 text-[10px]">Underlying Price</p>
               <div className="flex items-baseline gap-2">
-                <h3 className="text-3xl font-black text-slate-900 tracking-tighter">${currentPrice.toLocaleString()}</h3>
-                <span className="text-xs font-bold text-green-600">+0.15%</span>
+                <h3 className="text-3xl font-black text-slate-900 tracking-tighter">${displayedPrice.toLocaleString()}</h3>
+                <span className={`text-xs font-bold ${changeColor}`}>{changeText}</span>
               </div>
+              {isCsvBackedTicker && isQuoteLoading && (
+                <p className="text-xs text-slate-400 font-semibold mt-2">Loading {ticker} quote...</p>
+              )}
+              {isCsvBackedTicker && quoteError && (
+                <p className="text-xs text-rose-600 font-semibold mt-2">{quoteError}</p>
+              )}
+              {isCsvBackedTicker && historyError && (
+                <p className="text-xs text-rose-600 font-semibold mt-2">{historyError}</p>
+              )}
             </div>
           </div>
 
@@ -259,7 +364,7 @@ const HedgeDashboard = () => {
                       <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#f1f5f9" />
                       <XAxis dataKey="date" hide />
                       <YAxis domain={['auto', 'auto']} hide />
-                      <Area type="monotone" dataKey="price" stroke="#6366f1" strokeWidth={3} fill="#6366f1" fillOpacity={0.05} />
+                      <Area type="monotone" dataKey="close" stroke="#6366f1" strokeWidth={3} fill="#6366f1" fillOpacity={0.05} />
                     </AreaChart>
                   </ResponsiveContainer>
                 </div>
@@ -276,9 +381,9 @@ const HedgeDashboard = () => {
                       <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#f1f5f9" />
                       <XAxis dataKey="date" hide />
                       <YAxis hide />
-                      <Bar dataKey="suggestedHedge" radius={[6, 6, 6, 6]}>
+                      <Bar dataKey="hedge_intensity" radius={[6, 6, 6, 6]}>
                         {chartData.map((entry, index) => (
-                          <Cell key={`cell-${index}`} fill={entry.suggestedHedge >= 75 ? '#6366f1' : '#f1f5f9'} />
+                          <Cell key={`cell-${index}`} fill={entry.hedge_intensity >= 75 ? '#6366f1' : '#f1f5f9'} />
                         ))}
                       </Bar>
                     </BarChart>

@@ -3,12 +3,17 @@ import json
 import os
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 import joblib
 import pandas as pd
 
 
 MODEL_PATH = Path(__file__).resolve().parents[1] / "models" / "hedge_xgb.joblib"
+DIA_CSV_PATH = Path(__file__).resolve().parents[2] / "data" / "dia_us_d.csv"
+IWM_CSV_PATH = Path(__file__).resolve().parents[2] / "data" / "IWM_data.csv"
+QQQ_CSV_PATH = Path(__file__).resolve().parents[2] / "data" / "qqq_us_d.csv"
+SPY_CSV_PATH = Path(__file__).resolve().parents[2] / "data" / "spy_us_d.csv"
 HOST = "0.0.0.0"
 PORT = 8000
 DEBUG_LOG_PATH = Path("/Users/boppa/fintech-26/.cursor/debug-d5969c.log")
@@ -64,6 +69,146 @@ class ModelService:
 MODEL_SERVICE = ModelService(MODEL_PATH)
 
 
+def _to_numeric_percent(value):
+    if pd.isna(value):
+        return None
+    cleaned = str(value).replace("%", "").strip()
+    if cleaned in {"", "-"}:
+        return None
+    return float(cleaned)
+
+
+class QuoteService:
+    def __init__(self, csv_paths):
+        self.csv_paths = csv_paths
+        self.quotes = {}
+        self.frames = {}
+        self.errors = {}
+        self._load_all()
+
+    def _load_all(self):
+        for ticker, csv_path in self.csv_paths.items():
+            try:
+                quote, frame = self._load_quote(csv_path, ticker)
+                self.quotes[ticker] = quote
+                self.frames[ticker] = frame
+            except Exception as err:
+                self.errors[ticker] = str(err)
+
+    def _load_quote(self, csv_path: Path, ticker: str):
+        if not csv_path.exists():
+            raise FileNotFoundError(f"{ticker} CSV not found at {csv_path}")
+
+        frame = pd.read_csv(csv_path)
+        # Some exports include a prefixed "git aDate" header; normalize it.
+        if "git aDate" in frame.columns and "Date" not in frame.columns:
+            frame = frame.rename(columns={"git aDate": "Date"})
+        columns = set(frame.columns)
+
+        if {"Date", "Close"}.issubset(columns):
+            frame["Date"] = pd.to_datetime(frame["Date"], errors="coerce")
+            frame["Close"] = pd.to_numeric(frame["Close"], errors="coerce")
+            frame = frame.dropna(subset=["Date", "Close"]).sort_values("Date")
+            if len(frame) < 2:
+                raise ValueError(f"{ticker} CSV must contain at least two valid rows")
+
+            previous_close = float(frame.iloc[-2]["Close"])
+            latest_close = float(frame.iloc[-1]["Close"])
+            change_pct = ((latest_close / previous_close) - 1.0) * 100.0
+            as_of = frame.iloc[-1]["Date"].date().isoformat()
+            quote = {
+                "ticker": ticker,
+                "price": latest_close,
+                "change_pct": change_pct,
+                "as_of": as_of,
+            }
+            return quote, frame[["Date", "Close"]].copy()
+
+        option_columns = {"Last Price", "% Change", "Last Trade Date (EDT)"}
+        if option_columns.issubset(columns):
+            frame["Last Price"] = pd.to_numeric(frame["Last Price"], errors="coerce")
+            frame["pct_change_numeric"] = frame["% Change"].apply(_to_numeric_percent)
+            frame["trade_dt"] = pd.to_datetime(frame["Last Trade Date (EDT)"], errors="coerce")
+            frame = frame.dropna(subset=["Last Price", "pct_change_numeric", "trade_dt"])
+            if frame.empty:
+                raise ValueError(f"{ticker} CSV did not have valid option quote rows")
+
+            latest_row = frame.sort_values("trade_dt").iloc[-1]
+            latest_price = float(latest_row["Last Price"])
+            change_pct = float(latest_row["pct_change_numeric"])
+            quote = {
+                "ticker": ticker,
+                "price": latest_price,
+                "change_pct": change_pct,
+                "as_of": latest_row["trade_dt"].date().isoformat(),
+            }
+            # Keep a consistent Date/Close shape for downstream history logic.
+            normalized = frame.rename(columns={"trade_dt": "Date", "Last Price": "Close"})
+            return quote, normalized[["Date", "Close"]].copy()
+
+        raise ValueError(f"{ticker} CSV is missing required quote columns")
+
+    def get_quote(self, ticker: str):
+        normalized = ticker.upper()
+        if normalized not in self.csv_paths:
+            raise ValueError(f"Unsupported ticker: {normalized}")
+        if normalized in self.errors:
+            raise RuntimeError(self.errors[normalized])
+        return self.quotes[normalized]
+
+    def get_history(self, ticker: str, window: int):
+        normalized = ticker.upper()
+        if normalized not in self.csv_paths:
+            raise ValueError(f"Unsupported ticker: {normalized}")
+        if normalized in self.errors:
+            raise RuntimeError(self.errors[normalized])
+        if window <= 0:
+            raise ValueError("window must be a positive integer")
+
+        frame = self.frames[normalized].copy()
+        frame["Date"] = pd.to_datetime(frame["Date"], errors="coerce")
+        frame["Close"] = pd.to_numeric(frame["Close"], errors="coerce")
+        frame = frame.dropna(subset=["Date", "Close"]).sort_values("Date")
+        if frame.empty:
+            raise ValueError(f"{normalized} history is empty after parsing")
+
+        frame["return_1d"] = frame["Close"].pct_change().fillna(0.0)
+
+        def to_hedge_bucket(abs_return):
+            if abs_return >= 0.02:
+                return 100
+            if abs_return >= 0.015:
+                return 75
+            if abs_return >= 0.01:
+                return 50
+            if abs_return >= 0.005:
+                return 25
+            return 0
+
+        frame["hedge_intensity"] = frame["return_1d"].abs().apply(to_hedge_bucket)
+        sample = frame.tail(window)
+        points = [
+            {
+                "date": row["Date"].date().isoformat(),
+                "close": float(row["Close"]),
+                "return_1d": float(row["return_1d"]),
+                "hedge_intensity": int(row["hedge_intensity"]),
+            }
+            for _, row in sample.iterrows()
+        ]
+        return {"ticker": normalized, "points": points}
+
+
+QUOTE_SERVICE = QuoteService(
+    {
+        "DIA": DIA_CSV_PATH,
+        "IWM": IWM_CSV_PATH,
+        "QQQ": QQQ_CSV_PATH,
+        "SPY": SPY_CSV_PATH,
+    }
+)
+
+
 class HedgeRequestHandler(BaseHTTPRequestHandler):
     def _send_json(self, status: int, payload: dict):
         encoded = json.dumps(payload).encode("utf-8")
@@ -80,7 +225,8 @@ class HedgeRequestHandler(BaseHTTPRequestHandler):
         self._send_json(200, {"ok": True})
 
     def do_GET(self):
-        if self.path == "/api/health":
+        parsed = urlparse(self.path)
+        if parsed.path == "/api/health":
             self._send_json(
                 200,
                 {
@@ -89,6 +235,44 @@ class HedgeRequestHandler(BaseHTTPRequestHandler):
                     "feature_count": len(MODEL_SERVICE.features),
                 },
             )
+            return
+        if parsed.path == "/api/quote":
+            query_params = parse_qs(parsed.query)
+            ticker = (query_params.get("ticker", [""])[0] or "").upper()
+            if not ticker:
+                self._send_json(400, {"error": "Missing required query param: ticker"})
+                return
+            try:
+                quote = QUOTE_SERVICE.get_quote(ticker)
+                self._send_json(200, quote)
+            except ValueError as err:
+                self._send_json(400, {"error": str(err)})
+            except RuntimeError as err:
+                self._send_json(500, {"error": f"Quote source unavailable: {err}"})
+            except Exception as err:
+                self._send_json(500, {"error": f"Quote lookup failed: {err}"})
+            return
+        if parsed.path == "/api/history":
+            query_params = parse_qs(parsed.query)
+            ticker = (query_params.get("ticker", [""])[0] or "").upper()
+            if not ticker:
+                self._send_json(400, {"error": "Missing required query param: ticker"})
+                return
+            raw_window = query_params.get("window", ["15"])[0]
+            try:
+                window = int(raw_window)
+            except ValueError:
+                self._send_json(400, {"error": "window must be an integer"})
+                return
+            try:
+                history = QUOTE_SERVICE.get_history(ticker, window)
+                self._send_json(200, history)
+            except ValueError as err:
+                self._send_json(400, {"error": str(err)})
+            except RuntimeError as err:
+                self._send_json(500, {"error": f"History source unavailable: {err}"})
+            except Exception as err:
+                self._send_json(500, {"error": f"History lookup failed: {err}"})
             return
 
         self._send_json(404, {"error": "Not found"})
