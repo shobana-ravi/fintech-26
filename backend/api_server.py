@@ -18,7 +18,8 @@ SPY_CSV_PATH = Path(__file__).resolve().parents[2] / "data" / "spy_us_d.csv"
 PAPER_ORDERS_PATH = Path(__file__).resolve().parents[1] / "data" / "paper_orders.json"
 HOST = "0.0.0.0"
 PORT = 8000
-DEBUG_LOG_PATH = Path("/Users/boppa/fintech-26/.cursor/debug-d5969c.log")
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+DEBUG_LOG_PATH = _REPO_ROOT / "outputs" / "agent_debug.log"
 
 
 def debug_log(run_id: str, hypothesis_id: str, location: str, message: str, data: dict):
@@ -32,8 +33,12 @@ def debug_log(run_id: str, hypothesis_id: str, location: str, message: str, data
         "data": data,
         "timestamp": int(pd.Timestamp.now("UTC").timestamp() * 1000),
     }
-    with DEBUG_LOG_PATH.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(payload) + "\n")
+    try:
+        DEBUG_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with DEBUG_LOG_PATH.open("a", encoding="utf-8", errors="replace", newline="\n") as handle:
+            handle.write(json.dumps(payload) + "\n")
+    except OSError:
+        pass
     #endregion
 
 

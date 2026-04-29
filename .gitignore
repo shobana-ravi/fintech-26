@@ -210,3 +210,6 @@ __marimo__/
 node_modules/
 .vscode/
 .DS_Store
+
+# Local agent debug log (api_server.py)
+outputs/agent_debug.log
