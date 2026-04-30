@@ -98,6 +98,7 @@ def generate_training_dataset(input_csv: str, output_csv=None):
     # Step 8: option P&L
     # -----------------------------
     df["option_pnl_contract"] = (df["option_price_next"] - df["option_price"]) * CONTRACT_SIZE
+    df["option_pnl"] = df["option_pnl_contract"] / CONTRACT_SIZE
 
     # -----------------------------
     # Step 8: compute hedge outcomes
@@ -147,17 +148,24 @@ def generate_training_dataset(input_csv: str, output_csv=None):
     df["target_class"] = target_classes
 
     # -----------------------------
-    # Step 10: build final training dataset
+    # Step 10: build final training dataset (schema matches models/XGBoost.py)
     # -----------------------------
+    df["spot_today"] = df["close"]
+    df["dte_today"] = df["dte"]
+    df["call_price"] = df["option_price"]
+    df["T"] = df["dte_today"] / 365.0
+
     final_columns = [
         "date",
-        "close",
+        "spot_today",
         "return_1d",
         "return_5d",
         "realized_vol_20d",
+        "sigma_next",
         "strike",
-        "dte",
-        "option_price",
+        "T",
+        "dte_today",
+        "call_price",
         "delta",
         "gamma",
         "theta",
@@ -166,6 +174,7 @@ def generate_training_dataset(input_csv: str, output_csv=None):
         "portfolio_gamma",
         "portfolio_theta",
         "portfolio_vega",
+        "option_pnl",
         "target_hedge_ratio_bucket",
         "target_class",
     ]

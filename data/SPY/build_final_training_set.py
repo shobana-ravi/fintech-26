@@ -149,6 +149,7 @@ df[["option_price_next", "delta_next", "gamma_next", "theta_next", "vega_next"]]
 
 # Long 1 contract
 df["option_pnl_contract"] = (df["option_price_next"] - df["option_price"]) * 100
+df["option_pnl"] = df["option_pnl_contract"] / 100
 df["spot_change"] = df["spot_next"] - df["spot"]
 
 # -----------------------------
@@ -195,17 +196,23 @@ ratio_to_class = {
 df["target_class"] = df["target_hedge_ratio_bucket"].map(ratio_to_class)
 
 # -----------------------------
-# Final training dataset
+# Final training dataset (schema matches models/XGBoost.py)
 # -----------------------------
+df["spot_today"] = df["spot"]
+df["dte_today"] = df["dte"]
+df["call_price"] = df["option_price"]
+
 final_cols = [
     "date",
-    "close",
+    "spot_today",
     "return_1d",
     "return_5d",
     "realized_vol_20d",
+    "sigma_next",
     "strike",
-    "dte",
-    "option_price",
+    "T",
+    "dte_today",
+    "call_price",
     "delta",
     "gamma",
     "theta",
@@ -214,6 +221,7 @@ final_cols = [
     "portfolio_gamma",
     "portfolio_theta",
     "portfolio_vega",
+    "option_pnl",
     "target_hedge_ratio_bucket",
     "target_class",
 ]
