@@ -1,13 +1,13 @@
 import React, { useState, useMemo, useEffect } from 'react';
-import { 
-  XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, AreaChart, Area,
+import {
+  XAxis, YAxis, CartesianGrid, ResponsiveContainer, AreaChart, Area,
   BarChart, Bar, Cell
 } from 'recharts';
-import { 
-  Settings, 
-  TrendingUp, 
-  ShieldCheck, 
-  Activity, 
+import {
+  Settings,
+  TrendingUp,
+  ShieldCheck,
+  Activity,
   RefreshCcw,
   LayoutDashboard,
   BrainCircuit,
@@ -15,93 +15,18 @@ import {
   Layers,
   Zap
 } from 'lucide-react';
-import { getHedgeRecommendation, getQuote, getHistory, placePaperOrder, getPaperOrders } from './services/hedgeApi';
+import {
+  getHedgeRecommendation,
+  getQuote,
+  getHistory,
+  getLatestFeatures,
+  placePaperOrder,
+  getPaperOrders
+} from './services/hedgeApi';
 
-const DTE = 30;
-const CONTRACT_MULT = 100;
-
-// FIX Bug 1: Map bucket index (0-4) to discrete hedge percentages
 const BUCKET_TO_PCT = [0, 25, 50, 75, 100];
 
-function computeMetricsFromHistory(points) {
-  if (!points || points.length < 2) {
-    return { return_1d: 0, return_5d: 0, realized_vol_20d: 0.2 };
-  }
-  const ordered = [...points].sort((a, b) => String(a.date).localeCompare(String(b.date)));
-  const last = ordered[ordered.length - 1];
-  const r1 = typeof last.return_1d === 'number' && !Number.isNaN(last.return_1d) ? last.return_1d : 0;
-  let r5 = 0;
-  if (ordered.length >= 6) {
-    const c0 = ordered[ordered.length - 1].close;
-    const c5 = ordered[ordered.length - 6].close;
-    if (c5 > 0) r5 = c0 / c5 - 1;
-  }
-  const returns = ordered
-    .map((p) => p.return_1d)
-    .filter((r) => typeof r === 'number' && !Number.isNaN(r));
-  const tail = returns.slice(-20);
-  let rv = 0.2;
-  if (tail.length >= 5) {
-    const mean = tail.reduce((a, b) => a + b, 0) / tail.length;
-    const variance =
-      tail.reduce((s, x) => s + (x - mean) ** 2, 0) / Math.max(tail.length - 1, 1);
-    rv = Math.sqrt(variance) * Math.sqrt(252);
-    if (!Number.isFinite(rv) || rv < 1e-6) rv = 0.2;
-  }
-  return { return_1d: r1, return_5d: r5, realized_vol_20d: Math.min(Math.max(rv, 0.01), 3) };
-}
-
-function buildModelFeaturePayload({
-  ticker,
-  spot,
-  historyPoints,
-  portfolioDeltaShares,
-  currentHedgeShares,
-}) {
-  const { return_1d, return_5d, realized_vol_20d } = computeMetricsFromHistory(historyPoints);
-  const strike = Math.round(spot);
-  const T = DTE / 365;
-  const dte_today = DTE;
-  const sigma_next = Math.min(realized_vol_20d * 1.02 + 0.001, 2.5);
-
-  // FIX Bug 2: Compute ticker-specific greeks from realized vol instead of hardcoded values
-  const sigma = realized_vol_20d;
-  const delta = 0.5;
-  const gamma = 1 / (spot * sigma * Math.sqrt(T) * Math.sqrt(2 * Math.PI));
-  const theta = -(spot * sigma * gamma) / (2 * Math.sqrt(T)) / 365;
-  const vega = spot * Math.sqrt(T) * gamma * sigma;
-
-  const callPrice = Math.max(spot * 0.02, 0.01);
-  const portfolioGamma = gamma * CONTRACT_MULT;
-  const portfolioTheta = theta * CONTRACT_MULT;
-  const portfolioVega = vega * CONTRACT_MULT;
-
-  return {
-    ticker,
-    portfolio_delta: portfolioDeltaShares,
-    current_hedge_shares: currentHedgeShares,
-    spot_today: spot,
-    return_1d,
-    return_5d,
-    realized_vol_20d,
-    sigma_next,
-    strike,
-    T,
-    dte_today,
-    call_price: callPrice,
-    delta,
-    gamma,
-    theta,
-    vega,
-    portfolio_gamma: portfolioGamma,
-    portfolio_theta: portfolioTheta,
-    portfolio_vega: portfolioVega,
-    option_pnl: 0,
-  };
-}
-
 const HedgeDashboard = () => {
-  // State for parameters
   const [ticker, setTicker] = useState('SPY');
   const [isUpdating, setIsUpdating] = useState(false);
   const [predictionError, setPredictionError] = useState('');
@@ -116,36 +41,36 @@ const HedgeDashboard = () => {
   const [executeError, setExecuteError] = useState('');
   const [paperOrders, setPaperOrders] = useState([]);
   const [recommendation, setRecommendation] = useState(null);
-  const [portfolioDeltaInput, setPortfolioDeltaInput] = useState('48');
-  const [currentHedgeInput, setCurrentHedgeInput] = useState('-20');
+  const [contractCountInput, setContractCountInput] = useState('1');
+  const [portfolioDeltaInput, setPortfolioDeltaInput] = useState('');
+  const [currentHedgeInput, setCurrentHedgeInput] = useState('0');
+  const [latestFeatureRow, setLatestFeatureRow] = useState(null);
+  const [latestFeatureError, setLatestFeatureError] = useState('');
 
-  // Ticker price data
-  const tickerPrices = { 
-    'SPY': 512.45, 
-    'QQQ': 445.18,
-    'DIA': 389.21, 
-    'IWM': 204.12 
+  const tickerPrices = {
+    SPY: 512.45,
+    QQQ: 445.18,
+    DIA: 389.21,
+    IWM: 204.12
   };
+
   const currentPrice = tickerPrices[ticker];
   const csvBackedTickers = new Set(['DIA', 'IWM', 'QQQ', 'SPY']);
   const isCsvBackedTicker = csvBackedTickers.has(ticker);
+
   const displayedPrice = isCsvBackedTicker && tickerQuote?.price ? tickerQuote.price : currentPrice;
   const displayedChangePct =
     isCsvBackedTicker && tickerQuote?.change_pct !== undefined ? tickerQuote.change_pct : 0.15;
   const changeText = `${displayedChangePct >= 0 ? '+' : ''}${displayedChangePct.toFixed(2)}%`;
   const changeColor = displayedChangePct >= 0 ? 'text-green-600' : 'text-rose-600';
 
-  // FIX Bug 1: Use BUCKET_TO_PCT lookup to map bucket index → 0/25/50/75/100
-  // If backend returns a ratio (0.0–1.0) instead of an index, fall back to *100 with rounding to nearest 25
   const recomHedgePct = useMemo(() => {
     if (!recommendation) return null;
     const raw = Number(recommendation.predicted_hedge_ratio_bucket);
     if (Number.isNaN(raw)) return null;
-    // If value is an integer index 0-4, use lookup table
     if (Number.isInteger(raw) && raw >= 0 && raw <= 4) {
       return BUCKET_TO_PCT[raw];
     }
-    // If value is a ratio 0.0-1.0, round to nearest valid bucket
     const pct = Math.round(raw * 100);
     const valid = [0, 25, 50, 75, 100];
     return valid.reduce((prev, curr) =>
@@ -159,19 +84,21 @@ const HedgeDashboard = () => {
       close: displayedPrice,
       hedge_intensity: 0,
     }));
-  }, [ticker, displayedPrice]);
+  }, [displayedPrice]);
+
   const chartData = historyData.length > 0 ? historyData : fallbackChartData;
 
-  // FIX Bug 2: Reset inputs and recommendation when ticker changes so each
-  // ticker starts fresh and doesn't carry over stale delta/hedge values
   useEffect(() => {
-    setPortfolioDeltaInput('48');
-    setCurrentHedgeInput('-20');
+    setContractCountInput('1');
+    setPortfolioDeltaInput('');
+    setCurrentHedgeInput('0');
     setRecommendation(null);
     setPredictionConfidence(null);
     setPredictionError('');
     setExecuteMessage('');
     setExecuteError('');
+    setLatestFeatureRow(null);
+    setLatestFeatureError('');
   }, [ticker]);
 
   useEffect(() => {
@@ -187,17 +114,11 @@ const HedgeDashboard = () => {
       setQuoteError('');
       try {
         const quote = await getQuote(ticker);
-        if (!isCancelled) {
-          setTickerQuote(quote);
-        }
+        if (!isCancelled) setTickerQuote(quote);
       } catch (error) {
-        if (!isCancelled) {
-          setQuoteError(error.message || `Could not fetch ${ticker} quote`);
-        }
+        if (!isCancelled) setQuoteError(error.message || `Could not fetch ${ticker} quote`);
       } finally {
-        if (!isCancelled) {
-          setIsQuoteLoading(false);
-        }
+        if (!isCancelled) setIsQuoteLoading(false);
       }
     };
 
@@ -212,13 +133,9 @@ const HedgeDashboard = () => {
     const loadPaperOrders = async () => {
       try {
         const data = await getPaperOrders(5);
-        if (!isCancelled) {
-          setPaperOrders(Array.isArray(data.orders) ? data.orders : []);
-        }
+        if (!isCancelled) setPaperOrders(Array.isArray(data.orders) ? data.orders : []);
       } catch (_error) {
-        if (!isCancelled) {
-          setPaperOrders([]);
-        }
+        if (!isCancelled) setPaperOrders([]);
       }
     };
     loadPaperOrders();
@@ -262,20 +179,50 @@ const HedgeDashboard = () => {
     };
   }, [isCsvBackedTicker, ticker]);
 
+  useEffect(() => {
+    if (!isCsvBackedTicker) return;
+
+    let isCancelled = false;
+    const loadLatestFeatures = async () => {
+      setLatestFeatureError('');
+      try {
+        const row = await getLatestFeatures(ticker);
+        if (!isCancelled) {
+          setLatestFeatureRow(row);
+
+          const contractCount = Number(contractCountInput);
+          const optionDelta = Number(row?.delta ?? 0);
+          if (Number.isFinite(contractCount) && Number.isFinite(optionDelta)) {
+            const livePortfolioDelta = optionDelta * 100 * contractCount;
+            setPortfolioDeltaInput(String(livePortfolioDelta));
+          }
+        }
+      } catch (error) {
+        if (!isCancelled) {
+          setLatestFeatureError(error.message || `Could not load latest ${ticker} feature row`);
+          setLatestFeatureRow(null);
+        }
+      }
+    };
+
+    loadLatestFeatures();
+    return () => {
+      isCancelled = true;
+    };
+  }, [isCsvBackedTicker, ticker, contractCountInput]);
+
   const handleUpdate = async () => {
     setIsUpdating(true);
     setPredictionError('');
     setRecommendation(null);
 
     try {
-      let spot = displayedPrice;
       if (isCsvBackedTicker) {
         try {
           setIsQuoteLoading(true);
           setQuoteError('');
           const quote = await getQuote(ticker);
           setTickerQuote(quote);
-          spot = quote.price;
         } catch (error) {
           setQuoteError(error.message || `Could not fetch ${ticker} quote`);
         } finally {
@@ -283,45 +230,49 @@ const HedgeDashboard = () => {
         }
       }
 
-      let historyPoints = [];
-      if (isCsvBackedTicker) {
-        try {
-          const history = await getHistory(ticker, 60);
-          historyPoints = history.points || [];
+      const latestFeatures = await getLatestFeatures(ticker);
+      setLatestFeatureRow(latestFeatures);
 
-          // FIX Bug 3: Sync chart state after fetching history in handleUpdate
-          setHistoryData(
-            historyPoints.map((point) => ({
-              date: point.date,
-              close: point.close,
-              hedge_intensity: point.hedge_intensity,
-            })),
-          );
-        } catch (_e) {
-          historyPoints = [];
-        }
+      const contractCount = Number(contractCountInput);
+      if (!Number.isFinite(contractCount) || contractCount <= 0) {
+        throw new Error('Contract count must be a positive number.');
       }
 
-      const portfolioDelta = Number(portfolioDeltaInput);
+      const optionDelta = Number(latestFeatures?.delta ?? 0);
+      if (!Number.isFinite(optionDelta)) {
+        throw new Error('Latest option delta is invalid.');
+      }
+
+      const livePortfolioDelta = optionDelta * 100 * contractCount;
+      setPortfolioDeltaInput(String(livePortfolioDelta));
+
       const currentHedge = Number(currentHedgeInput);
-      if (!Number.isFinite(portfolioDelta)) {
-        throw new Error('Portfolio delta must be a number (share-equivalent).');
-      }
       if (!Number.isFinite(currentHedge)) {
         throw new Error('Current hedge shares must be a number.');
       }
 
-      const payload = buildModelFeaturePayload({
+      const prediction = await getHedgeRecommendation({
         ticker,
-        spot,
-        historyPoints,
-        portfolioDeltaShares: portfolioDelta,
-        currentHedgeShares: currentHedge,
+        contract_count: contractCount,
+        current_hedge_shares: currentHedge,
+        use_latest_portfolio_row: true,
       });
 
-      const prediction = await getHedgeRecommendation(payload);
       setRecommendation(prediction);
       setPredictionConfidence(prediction.prediction_confidence);
+
+      try {
+        const history = await getHistory(ticker, 60);
+        setHistoryData(
+          (history.points || []).map((point) => ({
+            date: point.date,
+            close: point.close,
+            hedge_intensity: point.hedge_intensity,
+          })),
+        );
+      } catch (_e) {
+        // ignore
+      }
     } catch (error) {
       setPredictionError(error.message || 'Could not fetch recommendation');
       setPredictionConfidence(null);
@@ -350,7 +301,7 @@ const HedgeDashboard = () => {
         price: displayedPrice,
       });
       setExecuteMessage(
-        `Paper order filled: ${order.side.toUpperCase()} ${order.quantity} ${order.ticker} @ $${Number(order.filled_price).toFixed(2)}`,
+        `Paper order filled: ${order.side.toUpperCase()} ${order.quantity} ${order.ticker} @ $${Number(order.filled_price).toFixed(2)}`
       );
       const ordersResponse = await getPaperOrders(5);
       setPaperOrders(Array.isArray(ordersResponse.orders) ? ordersResponse.orders : []);
@@ -363,13 +314,14 @@ const HedgeDashboard = () => {
 
   return (
     <div className="min-h-screen bg-slate-50 text-slate-900 font-sans pb-12">
-      {/* Navigation */}
       <nav className="bg-white border-b border-slate-200 px-8 py-4 flex justify-between items-center sticky top-0 z-20">
         <div className="flex items-center gap-3">
           <div className="bg-indigo-600 p-2 rounded-xl shadow-lg">
             <ShieldCheck className="text-white w-5 h-5" />
           </div>
-          <h1 className="text-lg font-bold tracking-tight text-slate-800">DeltaGuard <span className="text-indigo-600">Pro</span></h1>
+          <h1 className="text-lg font-bold tracking-tight text-slate-800">
+            DeltaGuard <span className="text-indigo-600">Pro</span>
+          </h1>
         </div>
         <div className="flex items-center gap-6">
           <div className="flex items-center gap-2 px-3 py-1.5 bg-slate-100 rounded-full text-xs font-bold text-slate-500">
@@ -381,25 +333,26 @@ const HedgeDashboard = () => {
 
       <main className="p-6 max-w-6xl mx-auto space-y-6">
         <div className="grid grid-cols-12 gap-6">
-          
-          {/* Sidebar - Cleaned Controls */}
           <div className="col-span-12 lg:col-span-4 space-y-6">
             <div className="bg-white rounded-2xl border border-slate-200 p-6 shadow-sm">
               <div className="flex items-center gap-2 mb-6">
                 <Settings size={18} className="text-slate-400" />
                 <h2 className="font-bold text-slate-700">Position Configuration</h2>
               </div>
-              
+
               <div className="space-y-6">
-                {/* Ticker Selection */}
                 <div>
                   <label className="text-xs font-bold text-slate-400 uppercase block mb-3">Target Ticker</label>
                   <div className="grid grid-cols-2 gap-2">
                     {['SPY', 'QQQ', 'DIA', 'IWM'].map(t => (
-                      <button 
+                      <button
                         key={t}
                         onClick={() => setTicker(t)}
-                        className={`py-2.5 rounded-xl font-bold text-sm transition-all ${ticker === t ? 'bg-indigo-600 text-white shadow-md' : 'bg-slate-50 text-slate-600 hover:bg-slate-100 border border-transparent hover:border-slate-200'}`}
+                        className={`py-2.5 rounded-xl font-bold text-sm transition-all ${
+                          ticker === t
+                            ? 'bg-indigo-600 text-white shadow-md'
+                            : 'bg-slate-50 text-slate-600 hover:bg-slate-100 border border-transparent hover:border-slate-200'
+                        }`}
                       >
                         {t}
                       </button>
@@ -407,7 +360,6 @@ const HedgeDashboard = () => {
                   </div>
                 </div>
 
-                {/* Fixed Constraints Information */}
                 <div className="space-y-3 pt-2">
                   <div className="flex items-center justify-between p-3 bg-slate-50 rounded-xl border border-slate-100">
                     <div className="flex items-center gap-3">
@@ -428,18 +380,31 @@ const HedgeDashboard = () => {
 
                 <div className="space-y-3">
                   <label className="text-xs font-bold text-slate-400 uppercase block">
-                    Portfolio delta (share-equivalent)
+                    Contract count
+                  </label>
+                  <input
+                    type="text"
+                    inputMode="decimal"
+                    value={contractCountInput}
+                    onChange={(e) => setContractCountInput(e.target.value)}
+                    className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm font-semibold text-slate-800"
+                  />
+                  <p className="text-[10px] text-slate-400 leading-snug">
+                    Portfolio delta is computed as option delta × 100 × contract count.
+                  </p>
+                </div>
+
+                <div className="space-y-3">
+                  <label className="text-xs font-bold text-slate-400 uppercase block">
+                    Live portfolio delta (computed)
                   </label>
                   <input
                     type="text"
                     inputMode="decimal"
                     value={portfolioDeltaInput}
-                    onChange={(e) => setPortfolioDeltaInput(e.target.value)}
-                    className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm font-semibold text-slate-800"
+                    readOnly
+                    className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm font-semibold text-slate-800 bg-slate-50"
                   />
-                  <p className="text-[10px] text-slate-400 leading-snug">
-                    Use total delta in shares (e.g. option delta 0.48 × 100 contracts → 48).
-                  </p>
                 </div>
 
                 <div className="space-y-3">
@@ -455,7 +420,7 @@ const HedgeDashboard = () => {
                   />
                 </div>
 
-                <button 
+                <button
                   onClick={handleUpdate}
                   disabled={isUpdating}
                   className="w-full bg-slate-900 hover:bg-black text-white font-bold py-4 rounded-xl flex items-center justify-center gap-3 transition-all disabled:opacity-70 shadow-lg shadow-slate-200"
@@ -463,13 +428,16 @@ const HedgeDashboard = () => {
                   {isUpdating ? <RefreshCcw className="animate-spin" size={18} /> : <LayoutDashboard size={18} />}
                   {isUpdating ? 'Analyzing Market...' : 'Refresh Recommendation'}
                 </button>
+
                 {predictionError && (
                   <p className="text-xs text-rose-600 font-semibold">{predictionError}</p>
+                )}
+                {latestFeatureError && (
+                  <p className="text-xs text-rose-600 font-semibold">{latestFeatureError}</p>
                 )}
               </div>
             </div>
 
-            {/* Simple Price Card */}
             <div className="bg-white rounded-2xl border border-slate-200 p-6 shadow-sm">
               <p className="text-xs font-bold text-slate-400 uppercase tracking-widest mb-1 text-[10px]">Underlying Price</p>
               <div className="flex items-baseline gap-2">
@@ -488,10 +456,7 @@ const HedgeDashboard = () => {
             </div>
           </div>
 
-          {/* Main Content */}
           <div className="col-span-12 lg:col-span-8 space-y-6">
-            
-            {/* Recommendation Area */}
             <div className="bg-white rounded-3xl border border-slate-200 shadow-sm p-8">
               <div className="flex flex-col md:flex-row items-center gap-10">
                 <div className="flex-1 text-center md:text-left">
@@ -503,8 +468,7 @@ const HedgeDashboard = () => {
                     <span className="text-slate-300">Hedge</span>
                   </h2>
                   <p className="text-slate-500 mt-4 text-sm font-medium leading-relaxed max-w-sm">
-                    SPY-trained XGBoost hedge ratio for the 30-day ATM template on {ticker}. Refresh to
-                    re-run inference.
+                    Uses latest backend row for market features and user contract count for live portfolio delta.
                   </p>
                   {predictionConfidence !== null && (
                     <p className="text-xs font-semibold text-slate-400 mt-3">
@@ -517,6 +481,18 @@ const HedgeDashboard = () => {
                   <p className="font-bold text-slate-500 uppercase tracking-wide">After refresh</p>
                   {recommendation ? (
                     <>
+                      <div className="flex justify-between gap-2">
+                        <span>Model used</span>
+                        <span className="font-mono font-bold text-slate-900">
+                          {recommendation.model_used || recommendation.ticker}
+                        </span>
+                      </div>
+                      <div className="flex justify-between gap-2">
+                        <span>Contract count</span>
+                        <span className="font-mono font-bold text-slate-900">
+                          {Number(recommendation.contract_count ?? contractCountInput).toFixed(2)}
+                        </span>
+                      </div>
                       <div className="flex justify-between gap-2">
                         <span>Predicted hedge ratio</span>
                         <span className="font-mono font-bold text-slate-900">
@@ -555,7 +531,6 @@ const HedgeDashboard = () => {
                 </div>
               </div>
 
-              {/* ML Model Recommendation Label */}
               <div className="mt-10 p-7 bg-slate-900 rounded-3xl flex flex-col md:flex-row items-center justify-between gap-6 text-white shadow-xl">
                 <div className="flex items-center gap-5">
                   <div className="w-14 h-14 rounded-2xl bg-indigo-500 flex items-center justify-center shadow-lg shadow-indigo-500/20">
@@ -578,6 +553,7 @@ const HedgeDashboard = () => {
                   {isExecuting ? 'EXECUTING...' : 'EXECUTE'}
                 </button>
               </div>
+
               {executeMessage && (
                 <p className="mt-4 text-xs font-semibold text-emerald-600">{executeMessage}</p>
               )}
@@ -605,7 +581,6 @@ const HedgeDashboard = () => {
               </div>
             </div>
 
-            {/* Simple Visuals */}
             <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
               <div className="bg-white rounded-2xl border border-slate-200 p-6 shadow-sm">
                 <h3 className="font-bold text-slate-700 text-sm mb-6 flex items-center gap-2">
@@ -645,6 +620,38 @@ const HedgeDashboard = () => {
                 </div>
               </div>
             </div>
+
+            {latestFeatureRow && (
+              <div className="bg-white rounded-2xl border border-slate-200 p-6 shadow-sm">
+                <h3 className="font-bold text-slate-700 text-sm mb-4">Latest Backend Feature Row</h3>
+                <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-xs">
+                  <div className="rounded-xl bg-slate-50 p-3">
+                    <div className="text-slate-400">Spot</div>
+                    <div className="font-bold text-slate-900">
+                      {Number(latestFeatureRow.spot_today ?? latestFeatureRow.close ?? 0).toFixed(2)}
+                    </div>
+                  </div>
+                  <div className="rounded-xl bg-slate-50 p-3">
+                    <div className="text-slate-400">Option Delta</div>
+                    <div className="font-bold text-slate-900">
+                      {Number(latestFeatureRow.delta ?? 0).toFixed(4)}
+                    </div>
+                  </div>
+                  <div className="rounded-xl bg-slate-50 p-3">
+                    <div className="text-slate-400">Realized Vol</div>
+                    <div className="font-bold text-slate-900">
+                      {Number(latestFeatureRow.realized_vol_20d ?? 0).toFixed(4)}
+                    </div>
+                  </div>
+                  <div className="rounded-xl bg-slate-50 p-3">
+                    <div className="text-slate-400">Strike</div>
+                    <div className="font-bold text-slate-900">
+                      {Number(latestFeatureRow.strike ?? 0).toFixed(0)}
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
           </div>
         </div>
       </main>

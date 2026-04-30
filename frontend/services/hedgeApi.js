@@ -39,6 +39,17 @@ export async function getHistory(ticker, window = 15) {
   return data;
 }
 
+export async function getLatestFeatures(ticker) {
+  const response = await fetch(
+    `${API_BASE_URL}/api/latest-features?ticker=${encodeURIComponent(ticker)}`,
+  );
+  const data = await response.json();
+  if (!response.ok) {
+    throw new Error(data.error || "Could not load latest features");
+  }
+  return data;
+}
+
 export async function placePaperOrder(payload) {
   const response = await fetch(`${API_BASE_URL}/api/orders/paper`, {
     method: "POST",
