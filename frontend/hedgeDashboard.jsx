@@ -20,6 +20,9 @@ import { getHedgeRecommendation, getQuote, getHistory, placePaperOrder, getPaper
 const DTE = 30;
 const CONTRACT_MULT = 100;
 
+// FIX Bug 1: Map bucket index (0-4) to discrete hedge percentages
+const BUCKET_TO_PCT = [0, 25, 50, 75, 100];
+
 function computeMetricsFromHistory(points) {
   if (!points || points.length < 2) {
     return { return_1d: 0, return_5d: 0, realized_vol_20d: 0.2 };
@@ -60,10 +63,14 @@ function buildModelFeaturePayload({
   const T = DTE / 365;
   const dte_today = DTE;
   const sigma_next = Math.min(realized_vol_20d * 1.02 + 0.001, 2.5);
+
+  // FIX Bug 2: Compute ticker-specific greeks from realized vol instead of hardcoded values
+  const sigma = realized_vol_20d;
   const delta = 0.5;
-  const gamma = 0.15;
-  const theta = -6.0;
-  const vega = 9.0;
+  const gamma = 1 / (spot * sigma * Math.sqrt(T) * Math.sqrt(2 * Math.PI));
+  const theta = -(spot * sigma * gamma) / (2 * Math.sqrt(T)) / 365;
+  const vega = spot * Math.sqrt(T) * gamma * sigma;
+
   const callPrice = Math.max(spot * 0.02, 0.01);
   const portfolioGamma = gamma * CONTRACT_MULT;
   const portfolioTheta = theta * CONTRACT_MULT;
@@ -127,10 +134,24 @@ const HedgeDashboard = () => {
     isCsvBackedTicker && tickerQuote?.change_pct !== undefined ? tickerQuote.change_pct : 0.15;
   const changeText = `${displayedChangePct >= 0 ? '+' : ''}${displayedChangePct.toFixed(2)}%`;
   const changeColor = displayedChangePct >= 0 ? 'text-green-600' : 'text-rose-600';
-  
-  const recomHedgePct = recommendation
-    ? Math.round(Number(recommendation.predicted_hedge_ratio_bucket) * 100)
-    : null;
+
+  // FIX Bug 1: Use BUCKET_TO_PCT lookup to map bucket index → 0/25/50/75/100
+  // If backend returns a ratio (0.0–1.0) instead of an index, fall back to *100 with rounding to nearest 25
+  const recomHedgePct = useMemo(() => {
+    if (!recommendation) return null;
+    const raw = Number(recommendation.predicted_hedge_ratio_bucket);
+    if (Number.isNaN(raw)) return null;
+    // If value is an integer index 0-4, use lookup table
+    if (Number.isInteger(raw) && raw >= 0 && raw <= 4) {
+      return BUCKET_TO_PCT[raw];
+    }
+    // If value is a ratio 0.0-1.0, round to nearest valid bucket
+    const pct = Math.round(raw * 100);
+    const valid = [0, 25, 50, 75, 100];
+    return valid.reduce((prev, curr) =>
+      Math.abs(curr - pct) < Math.abs(prev - pct) ? curr : prev
+    );
+  }, [recommendation]);
 
   const fallbackChartData = useMemo(() => {
     return Array.from({ length: 15 }, (_, i) => ({
@@ -140,6 +161,18 @@ const HedgeDashboard = () => {
     }));
   }, [ticker, displayedPrice]);
   const chartData = historyData.length > 0 ? historyData : fallbackChartData;
+
+  // FIX Bug 2: Reset inputs and recommendation when ticker changes so each
+  // ticker starts fresh and doesn't carry over stale delta/hedge values
+  useEffect(() => {
+    setPortfolioDeltaInput('48');
+    setCurrentHedgeInput('-20');
+    setRecommendation(null);
+    setPredictionConfidence(null);
+    setPredictionError('');
+    setExecuteMessage('');
+    setExecuteError('');
+  }, [ticker]);
 
   useEffect(() => {
     if (!isCsvBackedTicker) {
@@ -255,6 +288,15 @@ const HedgeDashboard = () => {
         try {
           const history = await getHistory(ticker, 60);
           historyPoints = history.points || [];
+
+          // FIX Bug 3: Sync chart state after fetching history in handleUpdate
+          setHistoryData(
+            historyPoints.map((point) => ({
+              date: point.date,
+              close: point.close,
+              hedge_intensity: point.hedge_intensity,
+            })),
+          );
         } catch (_e) {
           historyPoints = [];
         }

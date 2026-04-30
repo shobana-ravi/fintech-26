@@ -35,6 +35,15 @@ HOST = "0.0.0.0"
 PORT = 8001
 DEBUG_LOG_PATH = _REPO_ROOT / "outputs" / "agent_debug.log"
 
+# Map every supported ticker to its raw price CSV so ModelService can
+# compute realized-vol stats at startup for cross-ticker normalization.
+TICKER_CSV_MAP = {
+    "SPY": SPY_CSV_PATH,
+    "QQQ": QQQ_CSV_PATH,
+    "DIA": DIA_CSV_PATH,
+    "IWM": IWM_CSV_PATH,
+}
+
 
 def debug_log(run_id: str, hypothesis_id: str, location: str, message: str, data: dict):
     #region agent log
@@ -56,6 +65,38 @@ def debug_log(run_id: str, hypothesis_id: str, location: str, message: str, data
     #endregion
 
 
+def _compute_annualized_vol(csv_path: Path) -> float:
+    """
+    Read a price CSV and return annualized realized vol (stddev of daily log-returns
+    scaled by sqrt(252)).  Falls back to 0.15 if the file is missing or malformed.
+    Handles both the standard Date/Close layout and the option-chain layout used by
+    some of the ticker CSVs (Last Price / Last Trade Date columns).
+    """
+    if not csv_path.exists():
+        return 0.15
+    try:
+        df = pd.read_csv(csv_path)
+        # Normalize a prefixed header that occasionally appears in git-exported CSVs.
+        if "git aDate" in df.columns and "Date" not in df.columns:
+            df = df.rename(columns={"git aDate": "Date"})
+
+        if "Close" in df.columns:
+            prices = pd.to_numeric(df["Close"], errors="coerce").dropna()
+        elif "Last Price" in df.columns:
+            prices = pd.to_numeric(df["Last Price"], errors="coerce").dropna()
+        else:
+            return 0.15
+
+        if len(prices) < 10:
+            return 0.15
+
+        log_rets = np.log(prices.values[1:] / prices.values[:-1])
+        rv = float(np.std(log_rets, ddof=1)) * np.sqrt(252)
+        return rv if np.isfinite(rv) and rv > 1e-6 else 0.15
+    except Exception:
+        return 0.15
+
+
 class ModelService:
     def __init__(self, model_path: Path):
         self.bundle = joblib.load(model_path)
@@ -65,6 +106,7 @@ class ModelService:
         self.feature_cols = list(self.bundle.get("feature_cols", FEATURE_COLS))
         self._return_1d_clip = (-float("inf"), float("inf"))
         self._return_5d_clip = (-float("inf"), float("inf"))
+
         if SPY_TRAINING_STATS_CSV.exists():
             try:
                 stats = pd.read_csv(SPY_TRAINING_STATS_CSV, usecols=["return_1d", "return_5d"])
@@ -80,6 +122,28 @@ class ModelService:
             except (ValueError, OSError, KeyError):
                 pass
 
+        # --- Option 2: per-ticker annualized vol computed at startup ---
+        # Build a vol table for every supported ticker from its raw CSV so that
+        # predict() can scale vol-sensitive Greeks relative to the SPY baseline
+        # the model was trained on, giving each ticker a differentiated feature
+        # vector rather than identical SPY-style values.
+        self._ticker_vol: dict[str, float] = {}
+        for ticker, csv_path in TICKER_CSV_MAP.items():
+            self._ticker_vol[ticker] = _compute_annualized_vol(csv_path)
+
+        # SPY's own realized vol is the denominator for all vol-ratio calculations.
+        self._spy_vol: float = self._ticker_vol.get("SPY", 0.15)
+        if self._spy_vol < 1e-6:
+            self._spy_vol = 0.15
+
+        debug_log(
+            run_id="option2",
+            hypothesis_id="H-vol-norm",
+            location="ModelService.__init__",
+            message="Per-ticker annualized vol table built",
+            data={t: round(v, 6) for t, v in self._ticker_vol.items()},
+        )
+
     def _clip_returns_like_training(self, row: dict) -> None:
         lo, hi = self._return_1d_clip
         row["return_1d"] = min(max(float(row["return_1d"]), lo), hi)
@@ -94,11 +158,59 @@ class ModelService:
             raise ValueError("Missing required field: portfolio_delta")
 
         user_portfolio_delta = float(payload["portfolio_delta"])
+        ticker = str(payload.get("ticker", "SPY")).upper()
 
         row = {c: float(payload[c]) for c in self.feature_cols}
-        # Training rows use BS option Greeks and portfolio_* = greek * 100; placeholders
-        # from the client would skew predictions (often always 0% hedge).
+
+        # --- Option 2: ticker-aware feature normalization ---
+        #
+        # Step 1 – capture the ticker's actual realized vol from the payload
+        #           (computed from live history by the frontend) and from the
+        #           startup vol table.  Use whichever is available; prefer the
+        #           live payload value because it reflects the current window.
+        payload_vol = float(payload.get("realized_vol_20d", 0.0))
+        startup_vol = self._ticker_vol.get(ticker, self._spy_vol)
+        ticker_vol = payload_vol if payload_vol > 1e-6 else startup_vol
+
+        # Step 2 – vol ratio relative to SPY training baseline.
+        #           A ratio > 1 means the ticker is more volatile than SPY was
+        #           during training (e.g. IWM in a risk-off period); < 1 means
+        #           calmer (e.g. DIA on a quiet day).
+        vol_ratio = ticker_vol / self._spy_vol
+
+        # Step 3 – inject the ticker's realized vol into the row BEFORE the
+        #           training-style transform so that return-clipping and
+        #           sigma_next use the correct distribution for this ticker.
+        row["realized_vol_20d"] = ticker_vol
+        row["sigma_next"] = float(payload.get("sigma_next", min(ticker_vol * 1.02 + 0.001, 2.5)))
+
+        # Step 4 – apply the training-style Greek overwrite (required so the
+        #           feature vector matches the schema the model was trained on).
         apply_training_style_option_row(row)
+
+        # Step 5 – re-apply ticker vol after the overwrite (the transform resets
+        #           realized_vol_20d to the SPY training median).
+        row["realized_vol_20d"] = ticker_vol
+        row["sigma_next"] = min(ticker_vol * 1.02 + 0.001, 2.5)
+
+        # Step 6 – scale vol-sensitive Greeks by vol_ratio so the model sees
+        #           differentiated values per ticker instead of identical SPY
+        #           placeholder Greeks for every request.
+        for greek in ("vega", "gamma", "theta"):
+            if greek in row:
+                row[greek] = row[greek] * vol_ratio
+        for portfolio_greek in ("portfolio_vega", "portfolio_gamma", "portfolio_theta"):
+            base = portfolio_greek.replace("portfolio_", "")
+            if base in row:
+                row[portfolio_greek] = row[base] * 100.0
+
+        # Step 7 – also scale return features: a +1 % day on IWM is a less
+        #           extreme signal than on SPY, so normalise by vol_ratio to
+        #           keep the returns in the same distributional space the model
+        #           was trained on.
+        if vol_ratio > 1e-6:
+            row["return_1d"] = float(row["return_1d"]) / vol_ratio
+            row["return_5d"] = float(row["return_5d"]) / vol_ratio
 
         if abs(float(row["option_pnl"])) < 1e-8:
             row["option_pnl"] = SPY_TRAINING_MEDIAN_OPTION_PNL
@@ -153,13 +265,30 @@ class ModelService:
         shares_to_trade = target_hedge_shares - current_hedge
         action = format_trade_action(shares_to_trade)
 
+        debug_log(
+            run_id="option2",
+            hypothesis_id="H-vol-norm",
+            location="ModelService.predict",
+            message="Prediction completed with ticker-aware vol normalization",
+            data={
+                "ticker": ticker,
+                "ticker_vol": round(ticker_vol, 6),
+                "spy_vol": round(self._spy_vol, 6),
+                "vol_ratio": round(vol_ratio, 6),
+                "predicted_bucket": predicted_bucket,
+                "confidence": round(confidence, 4),
+            },
+        )
+
         return {
             "predicted_hedge_class": predicted_enc,
             "predicted_hedge_ratio_bucket": predicted_bucket,
             "prediction_confidence": confidence,
             "features_used": self.all_features,
             "base_features": self.feature_cols,
-            "ticker": payload.get("ticker", "UNKNOWN"),
+            "ticker": ticker,
+            "ticker_vol": round(ticker_vol, 6),
+            "vol_ratio": round(vol_ratio, 6),
             "portfolio_delta": user_portfolio_delta,
             "current_hedge_shares": current_hedge,
             "target_hedge_shares": target_hedge_shares,
@@ -360,6 +489,11 @@ class HedgeRequestHandler(BaseHTTPRequestHandler):
                     "status": "ok",
                     "model_path": str(MODEL_PATH),
                     "feature_count": len(MODEL_SERVICE.all_features),
+                    # Expose the vol table so it can be inspected via /api/health
+                    "ticker_vol_table": {
+                        t: round(v, 6) for t, v in MODEL_SERVICE._ticker_vol.items()
+                    },
+                    "spy_baseline_vol": round(MODEL_SERVICE._spy_vol, 6),
                 },
             )
             return
