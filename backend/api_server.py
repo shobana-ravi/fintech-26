@@ -39,7 +39,7 @@ LATEST_FEATURE_ROW_PATHS = {
 }
 
 SPY_TRAINING_STATS_CSV = _REPO_ROOT / "data" / "SPY" / "spy_training_dataset.csv"
-DIA_CSV_PATH = _REPO_ROOT / "data" / "DIA" / "dia_us_d.csv"
+DIA_CSV_PATH = _REPO_ROOT / "data" / "dia_us_d.csv"
 IWM_CSV_PATH = _REPO_ROOT / "data" / "IWM" / "IWM_data.csv"
 QQQ_CSV_PATH = _REPO_ROOT / "data" / "QQQ" / "qqq_us_d.csv"
 SPY_CSV_PATH = _REPO_ROOT / "data" / "SPY" / "spy_us_d.csv"
