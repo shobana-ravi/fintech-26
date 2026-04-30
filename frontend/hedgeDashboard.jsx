@@ -24,8 +24,6 @@ import {
   getPaperOrders
 } from './services/hedgeApi';
 
-const BUCKET_TO_PCT = [0, 25, 50, 75, 100];
-
 const HedgeDashboard = () => {
   const [ticker, setTicker] = useState('SPY');
   const [isUpdating, setIsUpdating] = useState(false);
@@ -64,18 +62,12 @@ const HedgeDashboard = () => {
   const changeText = `${displayedChangePct >= 0 ? '+' : ''}${displayedChangePct.toFixed(2)}%`;
   const changeColor = displayedChangePct >= 0 ? 'text-green-600' : 'text-rose-600';
 
+  // Reflect backend value directly: 0.25 -> 25%, 1.0 -> 100%
   const recomHedgePct = useMemo(() => {
     if (!recommendation) return null;
     const raw = Number(recommendation.predicted_hedge_ratio_bucket);
-    if (Number.isNaN(raw)) return null;
-    if (Number.isInteger(raw) && raw >= 0 && raw <= 4) {
-      return BUCKET_TO_PCT[raw];
-    }
-    const pct = Math.round(raw * 100);
-    const valid = [0, 25, 50, 75, 100];
-    return valid.reduce((prev, curr) =>
-      Math.abs(curr - pct) < Math.abs(prev - pct) ? curr : prev
-    );
+    if (!Number.isFinite(raw)) return null;
+    return Math.round(raw * 100);
   }, [recommendation]);
 
   const fallbackChartData = useMemo(() => {
@@ -215,6 +207,7 @@ const HedgeDashboard = () => {
     setIsUpdating(true);
     setPredictionError('');
     setRecommendation(null);
+    setPredictionConfidence(null);
 
     try {
       if (isCsvBackedTicker) {
@@ -257,6 +250,8 @@ const HedgeDashboard = () => {
         current_hedge_shares: currentHedge,
         use_latest_portfolio_row: true,
       });
+
+      console.log('prediction from backend', prediction);
 
       setRecommendation(prediction);
       setPredictionConfidence(prediction.prediction_confidence);
@@ -481,6 +476,20 @@ const HedgeDashboard = () => {
                   <p className="font-bold text-slate-500 uppercase tracking-wide">After refresh</p>
                   {recommendation ? (
                     <>
+                      <div className="flex justify-between gap-2">
+                        <span>Raw backend bucket</span>
+                        <span className="font-mono font-bold text-slate-900">
+                          {String(recommendation.predicted_hedge_ratio_bucket)}
+                        </span>
+                      </div>
+                      {recommendation.soft_hedge_ratio_bucket !== undefined && (
+                        <div className="flex justify-between gap-2">
+                          <span>Soft bucket</span>
+                          <span className="font-mono font-bold text-slate-900">
+                            {Number(recommendation.soft_hedge_ratio_bucket).toFixed(4)}
+                          </span>
+                        </div>
+                      )}
                       <div className="flex justify-between gap-2">
                         <span>Model used</span>
                         <span className="font-mono font-bold text-slate-900">

@@ -39,7 +39,7 @@ LATEST_FEATURE_ROW_PATHS = {
 }
 
 SPY_TRAINING_STATS_CSV = _REPO_ROOT / "data" / "SPY" / "spy_training_dataset.csv"
-DIA_CSV_PATH = _REPO_ROOT / "data" / "dia_us_d.csv"
+DIA_CSV_PATH = _REPO_ROOT / "data" / "DIA" / "dia_us_d.csv"
 IWM_CSV_PATH = _REPO_ROOT / "data" / "IWM" / "IWM_data.csv"
 QQQ_CSV_PATH = _REPO_ROOT / "data" / "QQQ" / "qqq_us_d.csv"
 SPY_CSV_PATH = _REPO_ROOT / "data" / "SPY" / "spy_us_d.csv"
@@ -146,8 +146,6 @@ def load_latest_feature_row(ticker: str) -> dict:
     if "option_pnl" not in row:
         row["option_pnl"] = 0.0
 
-    # Important: do NOT trust dataset portfolio_delta for live sizing.
-    # We recompute it from option delta * 100 * contract_count.
     row["ticker"] = ticker
     return row
 
@@ -220,7 +218,6 @@ class ModelService:
             if greek in row:
                 row[greek] = row[greek] * vol_ratio
 
-        # Important: portfolio greeks should scale with contract count, not fixed 1 contract
         contract_count = float(payload.get("contract_count", 1) or 1)
         row["portfolio_delta"] = float(row["delta"]) * 100.0 * contract_count
         if "gamma" in row:
@@ -243,10 +240,32 @@ class ModelService:
         frame = engineer_features(frame)
         scored = frame[self.all_features].fillna(0)
 
-        predicted_enc = int(self.model.predict(scored)[0])
         probabilities = np.asarray(self.model.predict_proba(scored)[0], dtype=float)
         confidence = float(probabilities.max())
-        predicted_bucket = float(encoded_prediction_to_bucket(self.label_encoder, predicted_enc))
+        hard_class = int(np.argmax(probabilities))
+
+        class_buckets = np.array(
+            [float(encoded_prediction_to_bucket(self.label_encoder, i)) for i in range(len(probabilities))],
+            dtype=float,
+        )
+
+        soft_bucket = float(np.dot(probabilities, class_buckets))
+
+        lattice = np.array([0.0, 0.25, 0.5, 0.75, 1.0], dtype=float)
+        snapped_bucket = float(lattice[np.argmin(np.abs(lattice - soft_bucket))])
+
+        if snapped_bucket == 1.0 and confidence < 0.90:
+            snapped_bucket = 0.75
+        if snapped_bucket == 0.0 and confidence < 0.90:
+            snapped_bucket = 0.25
+
+        predicted_bucket = snapped_bucket
+
+        predicted_enc = hard_class
+        for enc_idx, b in enumerate(class_buckets):
+            if abs(float(b) - predicted_bucket) < 1e-9:
+                predicted_enc = enc_idx
+                break
 
         target_hedge_shares = -user_portfolio_delta * predicted_bucket
         shares_to_trade = target_hedge_shares - current_hedge
@@ -256,6 +275,8 @@ class ModelService:
             "predicted_hedge_class": predicted_enc,
             "predicted_hedge_ratio_bucket": predicted_bucket,
             "prediction_confidence": confidence,
+            "soft_hedge_ratio_bucket": soft_bucket,
+            "backend_version": "contract-count-v3-softprob",
             "features_used": self.all_features,
             "base_features": self.feature_cols,
             "ticker": ticker,
@@ -468,20 +489,20 @@ class HedgeRequestHandler(BaseHTTPRequestHandler):
                 200,
                 {
                     "status": "ok",
-                    "backend_version": "contract-count-v2",
+                    "backend_version": "contract-count-v3-softprob",
                     "loaded_models": sorted(MODEL_SERVICES.keys()),
                     "model_load_errors": MODEL_LOAD_ERRORS,
                     "feature_counts": {
                         ticker: len(service.all_features)
                         for ticker, service in MODEL_SERVICES.items()
-                },
-                "routes": [
-                    "/api/health",
-                    "/api/quote?ticker=SPY",
-                    "/api/history?ticker=SPY&window=15",
-                    "/api/latest-features?ticker=SPY",
-                    "/api/orders/paper?limit=20",
-                    "/api/hedge/recommend (POST)",
+                    },
+                    "routes": [
+                        "/api/health",
+                        "/api/quote?ticker=SPY",
+                        "/api/history?ticker=SPY&window=15",
+                        "/api/latest-features?ticker=SPY",
+                        "/api/orders/paper?limit=20",
+                        "/api/hedge/recommend (POST)",
                     ],
                 },
             )
@@ -577,7 +598,6 @@ class HedgeRequestHandler(BaseHTTPRequestHandler):
                 if use_latest:
                     latest_row = load_latest_feature_row(ticker)
 
-                    # Recompute live portfolio sizing from current option delta and contract count
                     option_delta = float(latest_row.get("delta", 0.0))
                     latest_row["portfolio_delta"] = option_delta * 100.0 * contract_count
                     if "gamma" in latest_row:
