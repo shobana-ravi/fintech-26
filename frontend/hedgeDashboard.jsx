@@ -431,9 +431,6 @@ const HedgeDashboard = () => {
                     {recomHedgePct != null ? `${recomHedgePct}%` : '—'}{' '}
                     <span className="text-slate-300">Hedge</span>
                   </h2>
-                  <p className="text-slate-500 mt-4 text-sm font-medium leading-relaxed max-w-sm mx-auto">
-                    Reflects the hedge bucket returned by the backend model.
-                  </p>
                 </div>
               </div>
 
