@@ -40,7 +40,6 @@ const HedgeDashboard = () => {
   const [paperOrders, setPaperOrders] = useState([]);
   const [recommendation, setRecommendation] = useState(null);
   const [contractCountInput, setContractCountInput] = useState('1');
-  const [portfolioDeltaInput, setPortfolioDeltaInput] = useState('');
   const [currentHedgeInput, setCurrentHedgeInput] = useState('0');
   const [latestFeatureRow, setLatestFeatureRow] = useState(null);
   const [latestFeatureError, setLatestFeatureError] = useState('');
@@ -62,7 +61,6 @@ const HedgeDashboard = () => {
   const changeText = `${displayedChangePct >= 0 ? '+' : ''}${displayedChangePct.toFixed(2)}%`;
   const changeColor = displayedChangePct >= 0 ? 'text-green-600' : 'text-rose-600';
 
-  // Reflect backend value directly: 0.25 -> 25%, 1.0 -> 100%
   const recomHedgePct = useMemo(() => {
     if (!recommendation) return null;
     const raw = Number(recommendation.predicted_hedge_ratio_bucket);
@@ -82,7 +80,6 @@ const HedgeDashboard = () => {
 
   useEffect(() => {
     setContractCountInput('1');
-    setPortfolioDeltaInput('');
     setCurrentHedgeInput('0');
     setRecommendation(null);
     setPredictionConfidence(null);
@@ -181,13 +178,6 @@ const HedgeDashboard = () => {
         const row = await getLatestFeatures(ticker);
         if (!isCancelled) {
           setLatestFeatureRow(row);
-
-          const contractCount = Number(contractCountInput);
-          const optionDelta = Number(row?.delta ?? 0);
-          if (Number.isFinite(contractCount) && Number.isFinite(optionDelta)) {
-            const livePortfolioDelta = optionDelta * 100 * contractCount;
-            setPortfolioDeltaInput(String(livePortfolioDelta));
-          }
         }
       } catch (error) {
         if (!isCancelled) {
@@ -230,14 +220,6 @@ const HedgeDashboard = () => {
       if (!Number.isFinite(contractCount) || contractCount <= 0) {
         throw new Error('Contract count must be a positive number.');
       }
-
-      const optionDelta = Number(latestFeatures?.delta ?? 0);
-      if (!Number.isFinite(optionDelta)) {
-        throw new Error('Latest option delta is invalid.');
-      }
-
-      const livePortfolioDelta = optionDelta * 100 * contractCount;
-      setPortfolioDeltaInput(String(livePortfolioDelta));
 
       const currentHedge = Number(currentHedgeInput);
       if (!Number.isFinite(currentHedge)) {
@@ -385,21 +367,8 @@ const HedgeDashboard = () => {
                     className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm font-semibold text-slate-800"
                   />
                   <p className="text-[10px] text-slate-400 leading-snug">
-                    Portfolio delta is computed as option delta × 100 × contract count.
+                    Used to scale the hedge sizing from the latest backend row.
                   </p>
-                </div>
-
-                <div className="space-y-3">
-                  <label className="text-xs font-bold text-slate-400 uppercase block">
-                    Live portfolio delta (computed)
-                  </label>
-                  <input
-                    type="text"
-                    inputMode="decimal"
-                    value={portfolioDeltaInput}
-                    readOnly
-                    className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm font-semibold text-slate-800 bg-slate-50"
-                  />
                 </div>
 
                 <div className="space-y-3">
@@ -453,8 +422,8 @@ const HedgeDashboard = () => {
 
           <div className="col-span-12 lg:col-span-8 space-y-6">
             <div className="bg-white rounded-3xl border border-slate-200 shadow-sm p-8">
-              <div className="flex flex-col md:flex-row items-center gap-10">
-                <div className="flex-1 text-center md:text-left">
+              <div className="flex flex-col items-center gap-10">
+                <div className="flex-1 text-center">
                   <div className="inline-flex items-center gap-2 px-3 py-1 bg-indigo-50 text-indigo-700 rounded-full text-[10px] font-black uppercase tracking-widest mb-4">
                     <BrainCircuit size={12} /> ML Optimization
                   </div>
@@ -462,81 +431,9 @@ const HedgeDashboard = () => {
                     {recomHedgePct != null ? `${recomHedgePct}%` : '—'}{' '}
                     <span className="text-slate-300">Hedge</span>
                   </h2>
-                  <p className="text-slate-500 mt-4 text-sm font-medium leading-relaxed max-w-sm">
-                    Uses latest backend row for market features and user contract count for live portfolio delta.
+                  <p className="text-slate-500 mt-4 text-sm font-medium leading-relaxed max-w-sm mx-auto">
+                    Reflects the hedge bucket returned by the backend model.
                   </p>
-                  {predictionConfidence !== null && (
-                    <p className="text-xs font-semibold text-slate-400 mt-3">
-                      Model confidence: {(predictionConfidence * 100).toFixed(1)}%
-                    </p>
-                  )}
-                </div>
-
-                <div className="w-full md:w-72 rounded-2xl border border-slate-100 bg-slate-50 p-4 text-left text-xs space-y-2 text-slate-600">
-                  <p className="font-bold text-slate-500 uppercase tracking-wide">After refresh</p>
-                  {recommendation ? (
-                    <>
-                      <div className="flex justify-between gap-2">
-                        <span>Raw backend bucket</span>
-                        <span className="font-mono font-bold text-slate-900">
-                          {String(recommendation.predicted_hedge_ratio_bucket)}
-                        </span>
-                      </div>
-                      {recommendation.soft_hedge_ratio_bucket !== undefined && (
-                        <div className="flex justify-between gap-2">
-                          <span>Soft bucket</span>
-                          <span className="font-mono font-bold text-slate-900">
-                            {Number(recommendation.soft_hedge_ratio_bucket).toFixed(4)}
-                          </span>
-                        </div>
-                      )}
-                      <div className="flex justify-between gap-2">
-                        <span>Model used</span>
-                        <span className="font-mono font-bold text-slate-900">
-                          {recommendation.model_used || recommendation.ticker}
-                        </span>
-                      </div>
-                      <div className="flex justify-between gap-2">
-                        <span>Contract count</span>
-                        <span className="font-mono font-bold text-slate-900">
-                          {Number(recommendation.contract_count ?? contractCountInput).toFixed(2)}
-                        </span>
-                      </div>
-                      <div className="flex justify-between gap-2">
-                        <span>Predicted hedge ratio</span>
-                        <span className="font-mono font-bold text-slate-900">
-                          {Number(recommendation.predicted_hedge_ratio_bucket).toFixed(2)}
-                        </span>
-                      </div>
-                      <div className="flex justify-between gap-2">
-                        <span>Portfolio delta</span>
-                        <span className="font-mono font-bold text-slate-900">
-                          {Number(recommendation.portfolio_delta).toFixed(2)}
-                        </span>
-                      </div>
-                      <div className="flex justify-between gap-2">
-                        <span>Target hedge shares</span>
-                        <span className="font-mono font-bold text-slate-900">
-                          {Number(recommendation.target_hedge_shares).toFixed(2)}
-                        </span>
-                      </div>
-                      <div className="flex justify-between gap-2">
-                        <span>Current hedge</span>
-                        <span className="font-mono font-bold text-slate-900">
-                          {Number(recommendation.current_hedge_shares).toFixed(2)}
-                        </span>
-                      </div>
-                      <div className="flex justify-between gap-2 border-t border-slate-200 pt-2 mt-2">
-                        <span>Adjustment</span>
-                        <span className="font-mono font-bold text-indigo-700">
-                          {Number(recommendation.shares_to_trade).toFixed(2)} sh
-                        </span>
-                      </div>
-                      <p className="text-slate-500 pt-1 capitalize">{recommendation.action}</p>
-                    </>
-                  ) : (
-                    <p className="text-slate-400">Click refresh to load model output.</p>
-                  )}
                 </div>
               </div>
 
@@ -629,38 +526,6 @@ const HedgeDashboard = () => {
                 </div>
               </div>
             </div>
-
-            {latestFeatureRow && (
-              <div className="bg-white rounded-2xl border border-slate-200 p-6 shadow-sm">
-                <h3 className="font-bold text-slate-700 text-sm mb-4">Latest Backend Feature Row</h3>
-                <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-xs">
-                  <div className="rounded-xl bg-slate-50 p-3">
-                    <div className="text-slate-400">Spot</div>
-                    <div className="font-bold text-slate-900">
-                      {Number(latestFeatureRow.spot_today ?? latestFeatureRow.close ?? 0).toFixed(2)}
-                    </div>
-                  </div>
-                  <div className="rounded-xl bg-slate-50 p-3">
-                    <div className="text-slate-400">Option Delta</div>
-                    <div className="font-bold text-slate-900">
-                      {Number(latestFeatureRow.delta ?? 0).toFixed(4)}
-                    </div>
-                  </div>
-                  <div className="rounded-xl bg-slate-50 p-3">
-                    <div className="text-slate-400">Realized Vol</div>
-                    <div className="font-bold text-slate-900">
-                      {Number(latestFeatureRow.realized_vol_20d ?? 0).toFixed(4)}
-                    </div>
-                  </div>
-                  <div className="rounded-xl bg-slate-50 p-3">
-                    <div className="text-slate-400">Strike</div>
-                    <div className="font-bold text-slate-900">
-                      {Number(latestFeatureRow.strike ?? 0).toFixed(0)}
-                    </div>
-                  </div>
-                </div>
-              </div>
-            )}
           </div>
         </div>
       </main>
