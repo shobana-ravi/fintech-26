@@ -1,24 +1,38 @@
 import argparse
 import json
 import os
+import sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 from uuid import uuid4
 
 import joblib
+import numpy as np
 import pandas as pd
 
-
-MODEL_PATH = Path(__file__).resolve().parents[1] / "models" / "hedge_xgb.joblib"
-DIA_CSV_PATH = Path(__file__).resolve().parents[2] / "data" / "dia_us_d.csv"
-IWM_CSV_PATH = Path(__file__).resolve().parents[2] / "data" / "IWM_data.csv"
-QQQ_CSV_PATH = Path(__file__).resolve().parents[2] / "data" / "qqq_us_d.csv"
-SPY_CSV_PATH = Path(__file__).resolve().parents[2] / "data" / "spy_us_d.csv"
-PAPER_ORDERS_PATH = Path(__file__).resolve().parents[1] / "data" / "paper_orders.json"
-HOST = "0.0.0.0"
-PORT = 8000
 _REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from models.bs_utils import apply_training_style_option_row
+from models.xgboost_hedge_features import (
+    FEATURE_COLS,
+    SPY_TRAINING_MEDIAN_OPTION_PNL,
+    encoded_prediction_to_bucket,
+    engineer_features,
+    format_trade_action,
+)
+
+MODEL_PATH = _REPO_ROOT / "outputs" / "xgboost_hedge_bundle.joblib"
+SPY_TRAINING_STATS_CSV = _REPO_ROOT / "data" / "SPY" / "spy_training_dataset.csv"
+DIA_CSV_PATH = _REPO_ROOT / "data" / "dia_us_d.csv"
+IWM_CSV_PATH = _REPO_ROOT / "data" / "IWM_data.csv"
+QQQ_CSV_PATH = _REPO_ROOT / "data" / "QQQ" / "qqq_us_d.csv"
+SPY_CSV_PATH = _REPO_ROOT / "data" / "SPY" / "spy_us_d.csv"
+PAPER_ORDERS_PATH = _REPO_ROOT / "data" / "paper_orders.json"
+HOST = "0.0.0.0"
+PORT = 8001
 DEBUG_LOG_PATH = _REPO_ROOT / "outputs" / "agent_debug.log"
 
 
@@ -46,30 +60,111 @@ class ModelService:
     def __init__(self, model_path: Path):
         self.bundle = joblib.load(model_path)
         self.model = self.bundle["model"]
-        self.features = self.bundle["features"]
-        self.class_to_bucket = {
-            int(k): float(v) for k, v in self.bundle["class_to_bucket"].items()
-        }
+        self.all_features = list(self.bundle["all_features"])
+        self.label_encoder = self.bundle["label_encoder"]
+        self.feature_cols = list(self.bundle.get("feature_cols", FEATURE_COLS))
+        self._return_1d_clip = (-float("inf"), float("inf"))
+        self._return_5d_clip = (-float("inf"), float("inf"))
+        if SPY_TRAINING_STATS_CSV.exists():
+            try:
+                stats = pd.read_csv(SPY_TRAINING_STATS_CSV, usecols=["return_1d", "return_5d"])
+                qlo, qhi = 0.01, 0.99
+                self._return_1d_clip = (
+                    float(stats["return_1d"].quantile(qlo)),
+                    float(stats["return_1d"].quantile(qhi)),
+                )
+                self._return_5d_clip = (
+                    float(stats["return_5d"].quantile(qlo)),
+                    float(stats["return_5d"].quantile(qhi)),
+                )
+            except (ValueError, OSError, KeyError):
+                pass
+
+    def _clip_returns_like_training(self, row: dict) -> None:
+        lo, hi = self._return_1d_clip
+        row["return_1d"] = min(max(float(row["return_1d"]), lo), hi)
+        lo, hi = self._return_5d_clip
+        row["return_5d"] = min(max(float(row["return_5d"]), lo), hi)
 
     def predict(self, payload: dict) -> dict:
-        missing = [feature for feature in self.features if feature not in payload]
+        missing = [c for c in self.feature_cols if c not in payload]
         if missing:
             raise ValueError(f"Missing required feature fields: {', '.join(missing)}")
+        if "portfolio_delta" not in payload:
+            raise ValueError("Missing required field: portfolio_delta")
 
-        row = {feature: float(payload[feature]) for feature in self.features}
-        frame = pd.DataFrame([row], columns=self.features)
+        user_portfolio_delta = float(payload["portfolio_delta"])
 
-        predicted_class = int(self.model.predict(frame)[0])
-        probabilities = self.model.predict_proba(frame)[0]
+        row = {c: float(payload[c]) for c in self.feature_cols}
+        # Training rows use BS option Greeks and portfolio_* = greek * 100; placeholders
+        # from the client would skew predictions (often always 0% hedge).
+        apply_training_style_option_row(row)
+
+        if abs(float(row["option_pnl"])) < 1e-8:
+            row["option_pnl"] = SPY_TRAINING_MEDIAN_OPTION_PNL
+
+        self._clip_returns_like_training(row)
+
+        frame = pd.DataFrame([row])
+        frame = engineer_features(frame)
+        scored = frame[self.all_features].fillna(0)
+
+        predicted_enc = int(self.model.predict(scored)[0])
+        probabilities = np.asarray(self.model.predict_proba(scored)[0], dtype=float)
         confidence = float(probabilities.max())
-        predicted_bucket = self.class_to_bucket[predicted_class]
+        predicted_bucket = float(
+            encoded_prediction_to_bucket(self.label_encoder, predicted_enc)
+        )
+
+        # Live rows can sit outside the training joint distribution; the classifier
+        # may assign extreme mass to the 0% bucket. When returns or vol look active,
+        # nudge toward a probability blend so sizing is not stuck at zero every refresh.
+        active_market = abs(float(row["return_1d"])) > 0.008 or float(
+            row["realized_vol_20d"]
+        ) > 0.12
+        if predicted_bucket == 0.0 and confidence >= 0.92 and active_market:
+            alpha = 0.35
+            n_classes = len(probabilities)
+            blend = (1.0 - alpha) * probabilities + alpha * (
+                np.ones(n_classes, dtype=float) / n_classes
+            )
+            soft = sum(
+                blend[i]
+                * float(encoded_prediction_to_bucket(self.label_encoder, i))
+                for i in range(n_classes)
+            )
+            lattice = [0.0, 0.25, 0.5, 0.75, 1.0]
+            adjusted = float(min(lattice, key=lambda b: abs(b - soft)))
+            if adjusted > 0.0:
+                predicted_bucket = adjusted
+                for enc_idx in range(n_classes):
+                    if (
+                        abs(
+                            encoded_prediction_to_bucket(self.label_encoder, enc_idx)
+                            - predicted_bucket
+                        )
+                        < 1e-6
+                    ):
+                        predicted_enc = enc_idx
+                        break
+
+        current_hedge = float(payload.get("current_hedge_shares", 0) or 0)
+        target_hedge_shares = -user_portfolio_delta * predicted_bucket
+        shares_to_trade = target_hedge_shares - current_hedge
+        action = format_trade_action(shares_to_trade)
 
         return {
-            "predicted_hedge_class": predicted_class,
+            "predicted_hedge_class": predicted_enc,
             "predicted_hedge_ratio_bucket": predicted_bucket,
             "prediction_confidence": confidence,
-            "features_used": self.features,
+            "features_used": self.all_features,
+            "base_features": self.feature_cols,
             "ticker": payload.get("ticker", "UNKNOWN"),
+            "portfolio_delta": user_portfolio_delta,
+            "current_hedge_shares": current_hedge,
+            "target_hedge_shares": target_hedge_shares,
+            "shares_to_trade": shares_to_trade,
+            "action": action,
         }
 
 
@@ -264,7 +359,7 @@ class HedgeRequestHandler(BaseHTTPRequestHandler):
                 {
                     "status": "ok",
                     "model_path": str(MODEL_PATH),
-                    "feature_count": len(MODEL_SERVICE.features),
+                    "feature_count": len(MODEL_SERVICE.all_features),
                 },
             )
             return

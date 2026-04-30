@@ -8,8 +8,7 @@ import {
   TrendingUp, 
   ShieldCheck, 
   Activity, 
-  RefreshCcw, 
-  ArrowRightLeft,
+  RefreshCcw,
   LayoutDashboard,
   BrainCircuit,
   Calendar,
@@ -17,6 +16,82 @@ import {
   Zap
 } from 'lucide-react';
 import { getHedgeRecommendation, getQuote, getHistory, placePaperOrder, getPaperOrders } from './services/hedgeApi';
+
+const DTE = 30;
+const CONTRACT_MULT = 100;
+
+function computeMetricsFromHistory(points) {
+  if (!points || points.length < 2) {
+    return { return_1d: 0, return_5d: 0, realized_vol_20d: 0.2 };
+  }
+  const ordered = [...points].sort((a, b) => String(a.date).localeCompare(String(b.date)));
+  const last = ordered[ordered.length - 1];
+  const r1 = typeof last.return_1d === 'number' && !Number.isNaN(last.return_1d) ? last.return_1d : 0;
+  let r5 = 0;
+  if (ordered.length >= 6) {
+    const c0 = ordered[ordered.length - 1].close;
+    const c5 = ordered[ordered.length - 6].close;
+    if (c5 > 0) r5 = c0 / c5 - 1;
+  }
+  const returns = ordered
+    .map((p) => p.return_1d)
+    .filter((r) => typeof r === 'number' && !Number.isNaN(r));
+  const tail = returns.slice(-20);
+  let rv = 0.2;
+  if (tail.length >= 5) {
+    const mean = tail.reduce((a, b) => a + b, 0) / tail.length;
+    const variance =
+      tail.reduce((s, x) => s + (x - mean) ** 2, 0) / Math.max(tail.length - 1, 1);
+    rv = Math.sqrt(variance) * Math.sqrt(252);
+    if (!Number.isFinite(rv) || rv < 1e-6) rv = 0.2;
+  }
+  return { return_1d: r1, return_5d: r5, realized_vol_20d: Math.min(Math.max(rv, 0.01), 3) };
+}
+
+function buildModelFeaturePayload({
+  ticker,
+  spot,
+  historyPoints,
+  portfolioDeltaShares,
+  currentHedgeShares,
+}) {
+  const { return_1d, return_5d, realized_vol_20d } = computeMetricsFromHistory(historyPoints);
+  const strike = Math.round(spot);
+  const T = DTE / 365;
+  const dte_today = DTE;
+  const sigma_next = Math.min(realized_vol_20d * 1.02 + 0.001, 2.5);
+  const delta = 0.5;
+  const gamma = 0.15;
+  const theta = -6.0;
+  const vega = 9.0;
+  const callPrice = Math.max(spot * 0.02, 0.01);
+  const portfolioGamma = gamma * CONTRACT_MULT;
+  const portfolioTheta = theta * CONTRACT_MULT;
+  const portfolioVega = vega * CONTRACT_MULT;
+
+  return {
+    ticker,
+    portfolio_delta: portfolioDeltaShares,
+    current_hedge_shares: currentHedgeShares,
+    spot_today: spot,
+    return_1d,
+    return_5d,
+    realized_vol_20d,
+    sigma_next,
+    strike,
+    T,
+    dte_today,
+    call_price: callPrice,
+    delta,
+    gamma,
+    theta,
+    vega,
+    portfolio_gamma: portfolioGamma,
+    portfolio_theta: portfolioTheta,
+    portfolio_vega: portfolioVega,
+    option_pnl: 0,
+  };
+}
 
 const HedgeDashboard = () => {
   // State for parameters
@@ -33,7 +108,10 @@ const HedgeDashboard = () => {
   const [executeMessage, setExecuteMessage] = useState('');
   const [executeError, setExecuteError] = useState('');
   const [paperOrders, setPaperOrders] = useState([]);
-  
+  const [recommendation, setRecommendation] = useState(null);
+  const [portfolioDeltaInput, setPortfolioDeltaInput] = useState('48');
+  const [currentHedgeInput, setCurrentHedgeInput] = useState('-20');
+
   // Ticker price data
   const tickerPrices = { 
     'SPY': 512.45, 
@@ -50,20 +128,9 @@ const HedgeDashboard = () => {
   const changeText = `${displayedChangePct >= 0 ? '+' : ''}${displayedChangePct.toFixed(2)}%`;
   const changeColor = displayedChangePct >= 0 ? 'text-green-600' : 'text-rose-600';
   
-  // The Model Output (0, 25, 50, 75, 100)
-  const [recomHedge, setRecomHedge] = useState(50); 
-
-  // Fixed Parameters
-  const dte = 30; 
-  const positionType = 'ATM Call';
-
-  // Execution logic: Convert % into shares to buy/sell
-  const sharesToHedge = useMemo(() => {
-    // Assumption: ATM Call typically has ~50 delta
-    const baseDelta = 50; 
-    const targetHedgeAmount = Math.round(Math.abs(baseDelta * (recomHedge / 100)));
-    return { count: targetHedgeAmount, action: 'Sell' };
-  }, [recomHedge]);
+  const recomHedgePct = recommendation
+    ? Math.round(Number(recommendation.predicted_hedge_ratio_bucket) * 100)
+    : null;
 
   const fallbackChartData = useMemo(() => {
     return Array.from({ length: 15 }, (_, i) => ({
@@ -162,47 +229,20 @@ const HedgeDashboard = () => {
     };
   }, [isCsvBackedTicker, ticker]);
 
-  const hedgeOptions = [
-    { value: 0, label: '0% hedge' },
-    { value: 25, label: '25% hedge' },
-    { value: 50, label: '50% hedge' },
-    { value: 75, label: '75% hedge' },
-    { value: 100, label: '100% hedge' },
-  ];
-
-  const buildFeaturePayload = (priceOverride = null) => {
-    const effectivePrice = typeof priceOverride === 'number' ? priceOverride : displayedPrice;
-    const strike = Math.round(effectivePrice);
-
-    return {
-      ticker,
-      close: effectivePrice,
-      return_1d: 0.0,
-      return_5d: 0.0,
-      realized_vol_20d: 0.2,
-      strike,
-      T: dte / 365,
-      option_price: Math.max(effectivePrice * 0.02, 0.01),
-      delta: 0.5,
-      gamma: 0.15,
-      theta: -6.0,
-      vega: 9.0
-    };
-  };
-
   const handleUpdate = async () => {
     setIsUpdating(true);
     setPredictionError('');
+    setRecommendation(null);
 
     try {
-      let payloadPrice = null;
+      let spot = displayedPrice;
       if (isCsvBackedTicker) {
         try {
           setIsQuoteLoading(true);
           setQuoteError('');
           const quote = await getQuote(ticker);
           setTickerQuote(quote);
-          payloadPrice = quote.price;
+          spot = quote.price;
         } catch (error) {
           setQuoteError(error.message || `Could not fetch ${ticker} quote`);
         } finally {
@@ -210,27 +250,61 @@ const HedgeDashboard = () => {
         }
       }
 
-      const prediction = await getHedgeRecommendation(buildFeaturePayload(payloadPrice));
-      setRecomHedge(Math.round(Number(prediction.predicted_hedge_ratio_bucket) * 100));
+      let historyPoints = [];
+      if (isCsvBackedTicker) {
+        try {
+          const history = await getHistory(ticker, 60);
+          historyPoints = history.points || [];
+        } catch (_e) {
+          historyPoints = [];
+        }
+      }
+
+      const portfolioDelta = Number(portfolioDeltaInput);
+      const currentHedge = Number(currentHedgeInput);
+      if (!Number.isFinite(portfolioDelta)) {
+        throw new Error('Portfolio delta must be a number (share-equivalent).');
+      }
+      if (!Number.isFinite(currentHedge)) {
+        throw new Error('Current hedge shares must be a number.');
+      }
+
+      const payload = buildModelFeaturePayload({
+        ticker,
+        spot,
+        historyPoints,
+        portfolioDeltaShares: portfolioDelta,
+        currentHedgeShares: currentHedge,
+      });
+
+      const prediction = await getHedgeRecommendation(payload);
+      setRecommendation(prediction);
       setPredictionConfidence(prediction.prediction_confidence);
     } catch (error) {
       setPredictionError(error.message || 'Could not fetch recommendation');
+      setPredictionConfidence(null);
     } finally {
       setIsUpdating(false);
     }
   };
 
   const handleExecute = async () => {
+    if (!recommendation) return;
+    const qty = Math.round(Math.abs(recommendation.shares_to_trade));
+    if (qty === 0) {
+      setExecuteError('No shares to trade for this recommendation.');
+      return;
+    }
     setIsExecuting(true);
     setExecuteMessage('');
     setExecuteError('');
     try {
-      const side = sharesToHedge.action.toLowerCase() === 'sell' ? 'sell' : 'buy';
+      const side = recommendation.shares_to_trade >= 0 ? 'buy' : 'sell';
       const order = await placePaperOrder({
         ticker,
         side,
-        quantity: sharesToHedge.count,
-        hedge_percent: recomHedge,
+        quantity: qty,
+        hedge_percent: recomHedgePct ?? 0,
         price: displayedPrice,
       });
       setExecuteMessage(
@@ -310,6 +384,35 @@ const HedgeDashboard = () => {
                   </div>
                 </div>
 
+                <div className="space-y-3">
+                  <label className="text-xs font-bold text-slate-400 uppercase block">
+                    Portfolio delta (share-equivalent)
+                  </label>
+                  <input
+                    type="text"
+                    inputMode="decimal"
+                    value={portfolioDeltaInput}
+                    onChange={(e) => setPortfolioDeltaInput(e.target.value)}
+                    className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm font-semibold text-slate-800"
+                  />
+                  <p className="text-[10px] text-slate-400 leading-snug">
+                    Use total delta in shares (e.g. option delta 0.48 × 100 contracts → 48).
+                  </p>
+                </div>
+
+                <div className="space-y-3">
+                  <label className="text-xs font-bold text-slate-400 uppercase block">
+                    Current hedge (shares, negative if short)
+                  </label>
+                  <input
+                    type="text"
+                    inputMode="decimal"
+                    value={currentHedgeInput}
+                    onChange={(e) => setCurrentHedgeInput(e.target.value)}
+                    className="w-full rounded-xl border border-slate-200 px-3 py-2 text-sm font-semibold text-slate-800"
+                  />
+                </div>
+
                 <button 
                   onClick={handleUpdate}
                   disabled={isUpdating}
@@ -354,10 +457,12 @@ const HedgeDashboard = () => {
                     <BrainCircuit size={12} /> ML Optimization
                   </div>
                   <h2 className="text-7xl font-black text-slate-900 tracking-tight">
-                    {recomHedge}% <span className="text-slate-300">Hedge</span>
+                    {recomHedgePct != null ? `${recomHedgePct}%` : '—'}{' '}
+                    <span className="text-slate-300">Hedge</span>
                   </h2>
                   <p className="text-slate-500 mt-4 text-sm font-medium leading-relaxed max-w-sm">
-                    Strategic offset recommended for the 30-day ATM Call on {ticker}. 
+                    SPY-trained XGBoost hedge ratio for the 30-day ATM template on {ticker}. Refresh to
+                    re-run inference.
                   </p>
                   {predictionConfidence !== null && (
                     <p className="text-xs font-semibold text-slate-400 mt-3">
@@ -366,20 +471,45 @@ const HedgeDashboard = () => {
                   )}
                 </div>
 
-                <div className="grid grid-cols-1 gap-2 w-full md:w-52">
-                  {hedgeOptions.map((opt) => (
-                    <button
-                      key={opt.value}
-                      onClick={() => setRecomHedge(opt.value)}
-                      className={`px-6 py-3 rounded-2xl border-2 transition-all font-bold text-sm ${
-                        recomHedge === opt.value 
-                        ? 'border-indigo-600 bg-indigo-50 text-indigo-900 shadow-sm ring-1 ring-indigo-600' 
-                        : 'border-slate-50 bg-slate-50 text-slate-400 hover:border-slate-200 hover:bg-white'
-                      }`}
-                    >
-                      {opt.label}
-                    </button>
-                  ))}
+                <div className="w-full md:w-72 rounded-2xl border border-slate-100 bg-slate-50 p-4 text-left text-xs space-y-2 text-slate-600">
+                  <p className="font-bold text-slate-500 uppercase tracking-wide">After refresh</p>
+                  {recommendation ? (
+                    <>
+                      <div className="flex justify-between gap-2">
+                        <span>Predicted hedge ratio</span>
+                        <span className="font-mono font-bold text-slate-900">
+                          {Number(recommendation.predicted_hedge_ratio_bucket).toFixed(2)}
+                        </span>
+                      </div>
+                      <div className="flex justify-between gap-2">
+                        <span>Portfolio delta</span>
+                        <span className="font-mono font-bold text-slate-900">
+                          {Number(recommendation.portfolio_delta).toFixed(2)}
+                        </span>
+                      </div>
+                      <div className="flex justify-between gap-2">
+                        <span>Target hedge shares</span>
+                        <span className="font-mono font-bold text-slate-900">
+                          {Number(recommendation.target_hedge_shares).toFixed(2)}
+                        </span>
+                      </div>
+                      <div className="flex justify-between gap-2">
+                        <span>Current hedge</span>
+                        <span className="font-mono font-bold text-slate-900">
+                          {Number(recommendation.current_hedge_shares).toFixed(2)}
+                        </span>
+                      </div>
+                      <div className="flex justify-between gap-2 border-t border-slate-200 pt-2 mt-2">
+                        <span>Adjustment</span>
+                        <span className="font-mono font-bold text-indigo-700">
+                          {Number(recommendation.shares_to_trade).toFixed(2)} sh
+                        </span>
+                      </div>
+                      <p className="text-slate-500 pt-1 capitalize">{recommendation.action}</p>
+                    </>
+                  ) : (
+                    <p className="text-slate-400">Click refresh to load model output.</p>
+                  )}
                 </div>
               </div>
 
@@ -391,12 +521,16 @@ const HedgeDashboard = () => {
                   </div>
                   <div>
                     <p className="text-xs font-bold opacity-50 uppercase tracking-widest mb-1">ML Model Recommendation</p>
-                    <p className="text-2xl font-bold">{sharesToHedge.action} {sharesToHedge.count} Shares of {ticker}</p>
+                    <p className="text-2xl font-bold capitalize">
+                      {recommendation?.action
+                        ? `${recommendation.action} (${ticker})`
+                        : 'Refresh to get trade instruction'}
+                    </p>
                   </div>
                 </div>
                 <button
                   onClick={handleExecute}
-                  disabled={isExecuting}
+                  disabled={isExecuting || !recommendation || Math.round(Math.abs(recommendation.shares_to_trade)) === 0}
                   className="bg-white text-slate-900 px-10 py-4 rounded-2xl font-black text-sm hover:bg-indigo-50 transition-all active:scale-95 shadow-xl disabled:opacity-70"
                 >
                   {isExecuting ? 'EXECUTING...' : 'EXECUTE'}

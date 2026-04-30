@@ -1,61 +1,52 @@
 # XGBoost Hedge Model
 
-This folder trains an XGBoost classifier from the final ML CSV and uses the
-saved model to predict hedge buckets.
+This folder contains two training paths:
 
-## Expected Input
+1. **`XGBoost.py` (dashboard / production inference)** — full feature set with engineered columns; saves `outputs/xgboost_hedge_bundle.joblib` for the API and `outputs/xgboost_hedge_model.json` for portability.
+2. **`train_xgboost.py` (legacy DIA-style CSV)** — simpler 12-column schema and `models/hedge_xgb.joblib` (not used by the hedge dashboard refresh flow).
 
-The training CSV should already be your final dataset and include:
+## Production bundle (refresh recommendation)
 
-- `close`
-- `return_1d`
-- `return_5d`
-- `realized_vol_20d`
-- `strike`
-- `T`
-- `option_price`
-- `delta`
-- `gamma`
-- `theta`
-- `vega`
-- `target_hedge_ratio_bucket`
-
-The target bucket must be one of:
-
-- `0.00`
-- `0.25`
-- `0.50`
-- `0.75`
-- `1.00`
-
-If the chronological training window does not contain all five buckets, the
-trainer automatically remaps the buckets it does see to contiguous class IDs and
-saves that mapping with the model.
-
-## Train
-
-From the repo root:
+Train on the final SPY dataset whose columns match `models/xgboost_hedge_features.py` (same schema as `data/SPY/build_final_training_set.py` output):
 
 ```bash
 python3 -m pip install -r requirements.txt
-python3 models/train_xgboost.py --input data/DIA/dia_ml_dataset.csv
+python3 models/XGBoost.py --csv data/SPY/spy_training_dataset.csv
 ```
 
 Outputs:
 
-- `models/hedge_xgb.joblib`
-- `models/hedge_xgb_metrics.json`
+- `outputs/xgboost_hedge_bundle.joblib` — **used by** `backend/api_server.py` for `/api/hedge/recommend`
+- `outputs/xgboost_hedge_model.json` — native XGBoost JSON
+- `outputs/xgboost_hedge_results.png`
 
-## Predict
-
-Score the latest row of a CSV:
-
-```bash
-python3 models/predict_hedge.py --model models/hedge_xgb.joblib --input data/DIA/dia_ml_dataset.csv --latest-only
-```
-
-Score a full CSV and save the results:
+Start the API from the repo root (default port **8001** to match the Vite frontend):
 
 ```bash
-python3 models/predict_hedge.py --model models/hedge_xgb.joblib --input data/DIA/dia_ml_dataset.csv --output models/dia_predictions.csv
+python3 backend/api_server.py
 ```
+
+The recommend endpoint expects JSON with every **base** feature in `FEATURE_COLS` (see `models/xgboost_hedge_features.py`), plus:
+
+- `portfolio_delta` — **share-equivalent** total delta (required for target hedge and trade math)
+- `current_hedge_shares` — optional, defaults to `0`
+
+The API returns `predicted_hedge_ratio_bucket`, `target_hedge_shares`, `shares_to_trade`, and `action`, among other fields.
+
+## Predict (CLI)
+
+Score the latest row of a CSV (must include all base feature columns):
+
+```bash
+python3 models/predict_hedge.py --model outputs/xgboost_hedge_bundle.joblib --input data/SPY/spy_training_dataset.csv --latest-only --current-hedge-shares -20
+```
+
+## Legacy `train_xgboost.py` (12-column CSV)
+
+For older DIA-style datasets with `close`, `option_price`, and `target_hedge_ratio_bucket`:
+
+```bash
+python3 models/train_xgboost.py --input data/DIA/dia_ml_dataset.csv
+```
+
+Outputs: `models/hedge_xgb.joblib`, `models/hedge_xgb_metrics.json`.
